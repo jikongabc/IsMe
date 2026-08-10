@@ -1,0 +1,51 @@
+{
+  "name": "isme",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx src/lib/db/migrate.ts",
+    "db:seed": "tsx src/lib/db/seed.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "bash scripts/prepare-standalone.sh && playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "backup": "tsx scripts/backup-db.ts",
+    "backup:docker": "bash scripts/backup-db.sh --docker",
+    "restore": "bash scripts/restore-db.sh",
+    "prepare:standalone": "bash scripts/prepare-standalone.sh"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1103.0",
+    "better-sqlite3": "^13.0.2",
+    "drizzle-orm": "^0.45.2",
+    "isomorphic-dompurify": "^3.21.0",
+    "nanoid": "^6.0.1",
+    "next": "16.3.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "^10.1.0",
+    "rehype-raw": "^7.0.0",
+    "rehype-sanitize": "^6.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@tailwindcss/postcss": "^4",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "drizzle-kit": "^0.31.10",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.0",
+    "tailwindcss": "^4",
+    "tsx": "^4.23.5",
+    "typescript": "^5",
+    "vitest": "^4.1.10"
+  }
+}

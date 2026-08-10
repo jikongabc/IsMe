@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      ADMIN_PASSWORD: ci-test-password-123456
+      SESSION_SECRET: ci-test-session-secret-at-least-32-chars
+      ISME_DATABASE_PATH: ./data/isme-ci.db
+      SITE_URL: http://127.0.0.1:3100
+      COGDOC_API_URL: ""
+      COGDOC_API_KEY: ""
+      E2E_PORT: "3100"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+      # Match the important first-deploy path: compilation must never depend on
+      # render-time demo seeding or a pre-populated SQLite file.
+      - name: Build from an empty database
+        env:
+          ISME_DATABASE_PATH: /tmp/isme-ci-empty.db
+        run: npm run build
+
+      - name: Verify migrate & seed commands
+        run: |
+          npm run db:migrate
+          npm run db:seed
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: End-to-end smoke
+        run: npm run test:e2e

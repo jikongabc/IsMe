@@ -1,0 +1,13 @@
+node_modules
+.next
+data/*.db
+data/*.db-*
+.git
+.env
+.env.local
+uploads
+*.md
+!README.md
+项目计划书.md
+AGENTS.md
+CLAUDE.md
