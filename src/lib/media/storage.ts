@@ -31,6 +31,15 @@ export type StoredObject = {
 
 export type MediaObjectDestination = Omit<StoredObject, "bytes" | "contentType">;
 
+export type MediaObjectDeleteResult = "deleted" | "not_found";
+
+export class MediaObjectAlreadyExistsError extends Error {
+  constructor() {
+    super("Media object already exists");
+    this.name = "MediaObjectAlreadyExistsError";
+  }
+}
+
 function uploadsDir(): string {
   return path.join(
     /*turbopackIgnore: true*/ process.cwd(),
@@ -135,6 +144,89 @@ export async function putMediaObject(
   };
 }
 
+function isStorageStatus(error: unknown, status: number): boolean {
+  if (typeof error !== "object" || error === null || !("$metadata" in error)) {
+    return false;
+  }
+  const metadata = error.$metadata;
+  return typeof metadata === "object"
+    && metadata !== null
+    && "httpStatusCode" in metadata
+    && metadata.httpStatusCode === status;
+}
+
+function isNamedError(error: unknown, name: string): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "name" in error
+    && error.name === name;
+}
+
+function isErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && error.code === code;
+}
+
+/** Create a new upload object without ever replacing an existing key. */
+export async function createMediaObject(
+  fileName: string,
+  bytes: Buffer,
+  contentType: string,
+): Promise<StoredObject> {
+  const destination = describeMediaObject(fileName);
+  const { key, name, storage: backend } = destination;
+
+  if (backend === "s3") {
+    const env = getEnv();
+    try {
+      await getS3Client().send(
+        new PutObjectCommand({
+          Bucket: env.S3_BUCKET,
+          Key: key,
+          Body: bytes,
+          ContentType: contentType,
+          ContentLength: bytes.length,
+          IfNoneMatch: "*",
+        }),
+      );
+    } catch (error) {
+      if (isStorageStatus(error, 412) || isNamedError(error, "PreconditionFailed")) {
+        throw new MediaObjectAlreadyExistsError();
+      }
+      throw error;
+    }
+    return {
+      key,
+      name,
+      url: destination.url,
+      bytes: bytes.length,
+      contentType,
+      storage: "s3",
+    };
+  }
+
+  const dir = uploadsDir();
+  await mkdir(dir, { recursive: true });
+  try {
+    await writeFile(path.join(dir, name), bytes, { flag: "wx" });
+  } catch (error) {
+    if (isErrorCode(error, "EEXIST")) {
+      throw new MediaObjectAlreadyExistsError();
+    }
+    throw error;
+  }
+  return {
+    key: name,
+    name,
+    url: `/uploads/${name}`,
+    bytes: bytes.length,
+    contentType,
+    storage: "local",
+  };
+}
+
 export async function readMediaObject(
   keyOrName: string,
   storage: StorageBackend,
@@ -184,11 +276,9 @@ export async function readMediaObject(
 export async function deleteMediaObject(
   keyOrName: string,
   storage: StorageBackend,
-): Promise<boolean> {
+): Promise<MediaObjectDeleteResult> {
   if (storage === "s3") {
-    const key = keyOrName.startsWith("media/")
-      ? keyOrName
-      : objectKeyForStorage(keyOrName, "s3");
+    const key = objectKeyForStorage(keyOrName, "s3");
     try {
       const env = getEnv();
       await getS3Client().send(
@@ -197,19 +287,25 @@ export async function deleteMediaObject(
           Key: key,
         }),
       );
-      return true;
-    } catch {
-      return false;
+      return "deleted";
+    } catch (error) {
+      if (isStorageStatus(error, 404) || isNamedError(error, "NoSuchKey")) {
+        return "not_found";
+      }
+      throw error;
     }
   }
 
   const safe = resolveUploadName(displayNameFromKey(keyOrName));
-  if (!safe) return false;
+  if (!safe) throw new Error("Invalid local media key");
   try {
     await unlink(path.join(uploadsDir(), safe));
-    return true;
-  } catch {
-    return false;
+    return "deleted";
+  } catch (error) {
+    if (isErrorCode(error, "ENOENT")) {
+      return "not_found";
+    }
+    throw error;
   }
 }
 
