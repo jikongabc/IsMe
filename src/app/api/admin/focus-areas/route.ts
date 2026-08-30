@@ -15,7 +15,7 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  const denied = await requireAdmin();
+  const denied = await requireAdmin(request);
   if (denied) return denied;
   const body = await parseJsonBody(request);
   if (!body.ok) return body.response;
@@ -29,7 +29,7 @@ export async function POST(request: Request) {
 }
 
 export async function PUT(request: Request) {
-  const denied = await requireAdmin();
+  const denied = await requireAdmin(request);
   if (denied) return denied;
   const body = await parseJsonBody(request);
   if (!body.ok) return body.response;
@@ -43,7 +43,7 @@ export async function PUT(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  const denied = await requireAdmin();
+  const denied = await requireAdmin(request);
   if (denied) return denied;
   const id = new URL(request.url).searchParams.get("id");
   if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { cogdocErrorResponse, loadAdminKb, requireAdminOrResponse } from "@/lib/api/admin-cogdoc";
 import { getIndexJob } from "@/lib/cogdoc/admin-client";
+import { privateJson } from "@/lib/http/admin-request";
 
 export const runtime = "nodejs";
 
@@ -17,7 +18,7 @@ export async function GET(_request: Request, { params }: Params) {
   try {
     const job = await getIndexJob(jobId);
     if (job.kb_id !== loaded.module.cogdocKbId) {
-      return NextResponse.json(
+      return privateJson(
         { error: "Job does not belong to this knowledge module", code: "FORBIDDEN" },
         { status: 403 },
       );

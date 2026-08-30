@@ -1,13 +1,14 @@
 import { NextResponse } from "next/server";
-import { cogdocErrorResponse, loadAdminKb, requireAdminOrResponse } from "@/lib/api/admin-cogdoc";
+import { cogdocErrorResponse, loadAdminKb } from "@/lib/api/admin-cogdoc";
+import { requireAdmin } from "@/lib/auth/require-admin";
 import { ensureKnowledgeBase } from "@/lib/cogdoc/admin-client";
 
 export const runtime = "nodejs";
 
 type Params = { params: Promise<{ id: string }> };
 
-export async function POST(_request: Request, { params }: Params) {
-  const denied = await requireAdminOrResponse();
+export async function POST(request: Request, { params }: Params) {
+  const denied = await requireAdmin(request);
   if (denied) return denied;
 
   const { id } = await params;

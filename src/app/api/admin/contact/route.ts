@@ -17,7 +17,7 @@ export async function GET() {
 }
 
 export async function PATCH(request: Request) {
-  const denied = await requireAdmin();
+  const denied = await requireAdmin(request);
   if (denied) return denied;
   const parsed = await parseJsonBody(request);
   if (!parsed.ok) return parsed.response;
@@ -32,7 +32,7 @@ export async function PATCH(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  const denied = await requireAdmin();
+  const denied = await requireAdmin(request);
   if (denied) return denied;
   const id = new URL(request.url).searchParams.get("id");
   if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
