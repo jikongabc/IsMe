@@ -7,6 +7,7 @@ import {
   resolveUploadName,
 } from "@/lib/media/keys";
 import {
+  createMediaObject,
   deleteMediaObject,
   guessContentType,
   listLocalDiskFiles,
@@ -32,6 +33,23 @@ export type RegisteredMediaObject = {
   contentType: string;
   storage: StorageBackend;
 };
+
+export type MediaRegistryErrorCode =
+  | "MEDIA_REGISTRATION_FAILED"
+  | "MEDIA_RECONCILE_REQUIRED";
+
+export class MediaRegistryError extends Error {
+  constructor(
+    readonly code: MediaRegistryErrorCode,
+    readonly key: string,
+    readonly storage: StorageBackend,
+  ) {
+    super(code === "MEDIA_RECONCILE_REQUIRED"
+      ? "Media registration requires reconciliation"
+      : "Media registration failed");
+    this.name = "MediaRegistryError";
+  }
+}
 
 async function backfillLocalDisk(): Promise<void> {
   if (storageBackend() !== "local") return;
@@ -103,19 +121,36 @@ export async function saveMedia(
   bytes: Buffer,
   contentType: string,
 ): Promise<StoredObject> {
-  const stored = await putMediaObject(fileName, bytes, contentType);
-  getDb()
-    .insert(mediaAssets)
-    .values({
-      id: nanoid(),
-      key: stored.key,
-      url: stored.url,
-      bytes: stored.bytes,
-      contentType: stored.contentType,
-      storage: stored.storage,
-      createdAt: new Date().toISOString(),
-    })
-    .run();
+  const stored = await createMediaObject(fileName, bytes, contentType);
+  try {
+    getDb()
+      .insert(mediaAssets)
+      .values({
+        id: nanoid(),
+        key: stored.key,
+        url: stored.url,
+        bytes: stored.bytes,
+        contentType: stored.contentType,
+        storage: stored.storage,
+        createdAt: new Date().toISOString(),
+      })
+      .run();
+  } catch {
+    try {
+      await deleteMediaObject(stored.key, stored.storage);
+    } catch {
+      throw new MediaRegistryError(
+        "MEDIA_RECONCILE_REQUIRED",
+        stored.key,
+        stored.storage,
+      );
+    }
+    throw new MediaRegistryError(
+      "MEDIA_REGISTRATION_FAILED",
+      stored.key,
+      stored.storage,
+    );
+  }
   return stored;
 }
 
@@ -186,11 +221,11 @@ export async function removeMedia(name: string): Promise<boolean> {
 
   if (!row) {
     // Legacy: file on disk but not registered
-    return deleteMediaObject(safe, "local");
+    return (await deleteMediaObject(safe, "local")) === "deleted";
   }
 
   const storage = (row.storage === "s3" ? "s3" : "local") as StorageBackend;
-  const deleted = await deleteMediaObject(row.key, storage);
+  await deleteMediaObject(row.key, storage);
   db.delete(mediaAssets).where(eq(mediaAssets.id, row.id)).run();
-  return deleted;
+  return true;
 }
