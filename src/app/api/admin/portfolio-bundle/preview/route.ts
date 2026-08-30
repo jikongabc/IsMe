@@ -15,10 +15,10 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
-  const denied = await requireAdmin();
-  if (denied) return privateJson({ error: "Unauthorized" }, { status: 401 });
   const originDenied = requireSameOrigin(request);
   if (originDenied) return originDenied;
+  const denied = await requireAdmin(request);
+  if (denied) return denied;
 
   const body = await parseJsonBody(request, {
     maxBytes: PORTFOLIO_BUNDLE_REQUEST_MAX_BYTES,

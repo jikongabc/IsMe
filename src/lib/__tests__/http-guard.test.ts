@@ -1,6 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { requireAdminMutation } from "@/lib/auth/require-admin";
 import { privateJson, requireSameOrigin } from "@/lib/http/admin-request";
 import { parseJsonBody } from "@/lib/http/parse-json";
+
+const sessionMocks = vi.hoisted(() => ({
+  isAdminAuthenticated: vi.fn(),
+}));
+
+vi.mock("@/lib/auth/session", () => sessionMocks);
+
+beforeEach(() => {
+  sessionMocks.isAdminAuthenticated.mockReset();
+});
 
 describe("admin mutation origin guard", () => {
   it("accepts an exact same-origin request", () => {
@@ -62,6 +73,57 @@ describe("admin mutation origin guard", () => {
     const result = privateJson({ ok: true });
     expect(result.headers.get("cache-control")).toContain("private");
     expect(result.headers.get("cache-control")).toContain("no-store");
+  });
+
+  it("rejects a cross-origin mutation before checking the session", async () => {
+    sessionMocks.isAdminAuthenticated.mockResolvedValue(true);
+
+    const result = await requireAdminMutation(
+      new Request("https://portfolio.example/api/admin/profile", {
+        method: "PUT",
+        headers: { origin: "https://attacker.example" },
+      }),
+    );
+
+    expect(result?.status).toBe(403);
+    expect(result?.headers.get("cache-control")).toContain("private");
+    expect(result?.headers.get("cache-control")).toContain("no-store");
+    expect(sessionMocks.isAdminAuthenticated).not.toHaveBeenCalled();
+  });
+
+  it("returns a private no-store 401 for a same-origin mutation without a session", async () => {
+    sessionMocks.isAdminAuthenticated.mockResolvedValue(false);
+
+    const result = await requireAdminMutation(
+      new Request("https://portfolio.example/api/admin/profile", {
+        method: "PUT",
+        headers: { origin: "https://portfolio.example" },
+      }),
+    );
+
+    expect(result?.status).toBe(401);
+    expect(result?.headers.get("cache-control")).toContain("private");
+    expect(result?.headers.get("cache-control")).toContain("no-store");
+  });
+
+  it.each([
+    ["direct development", "https://portfolio.example", undefined, undefined],
+    ["bundled proxy", "http://web:3000", "me.example", "https"],
+  ])("accepts an authenticated same-origin mutation through %s", async (_label, url, host, proto) => {
+    sessionMocks.isAdminAuthenticated.mockResolvedValue(true);
+    const origin = host ? `${proto}://${host}` : url;
+    const headers = new Headers({ origin });
+    if (host) headers.set("host", host);
+    if (proto) headers.set("x-forwarded-proto", proto);
+
+    await expect(
+      requireAdminMutation(
+        new Request(`${url}/api/admin/profile`, {
+          method: "PUT",
+          headers,
+        }),
+      ),
+    ).resolves.toBeNull();
   });
 });
 

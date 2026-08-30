@@ -12,7 +12,7 @@ export async function GET() {
 }
 
 export async function DELETE(request: Request) {
-  const denied = await requireAdmin();
+  const denied = await requireAdmin(request);
   if (denied) return denied;
   const name = new URL(request.url).searchParams.get("name");
   if (!name) return NextResponse.json({ error: "Missing name" }, { status: 400 });

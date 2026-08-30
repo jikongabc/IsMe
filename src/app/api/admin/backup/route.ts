@@ -9,7 +9,7 @@ import { backupDatabase } from "@/lib/db/backup";
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
-  const denied = await requireAdmin();
+  const denied = await requireAdmin(request);
   if (denied) return denied;
 
   let tempDir = "";

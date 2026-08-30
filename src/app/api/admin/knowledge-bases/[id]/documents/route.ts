@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { cogdocErrorResponse, loadAdminKb, requireAdminOrResponse } from "@/lib/api/admin-cogdoc";
+import { requireAdmin } from "@/lib/auth/require-admin";
 import {
   deleteDocument,
   listDocuments,
@@ -32,7 +33,7 @@ export async function GET(_request: Request, { params }: Params) {
 }
 
 export async function POST(request: Request, { params }: Params) {
-  const denied = await requireAdminOrResponse();
+  const denied = await requireAdmin(request);
   if (denied) return denied;
 
   const { id } = await params;
@@ -73,7 +74,7 @@ export async function POST(request: Request, { params }: Params) {
 }
 
 export async function DELETE(request: Request, { params }: Params) {
-  const denied = await requireAdminOrResponse();
+  const denied = await requireAdmin(request);
   if (denied) return denied;
 
   const { id } = await params;

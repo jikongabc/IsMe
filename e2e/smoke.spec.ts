@@ -137,6 +137,8 @@ test.describe("IsMe smoke", () => {
 
     const readinessApi = await request.get("/api/admin/readiness");
     expect(readinessApi.status()).toBe(401);
+    expect(readinessApi.headers()["cache-control"]).toContain("private");
+    expect(readinessApi.headers()["cache-control"]).toContain("no-store");
   });
 
   test("admin can login with env password", async ({ page }) => {
@@ -179,6 +181,60 @@ test.describe("IsMe smoke", () => {
     await dialog.dismiss();
     await navigationPromise;
     await expect(page).toHaveURL(/\/admin\/projects$/);
+  });
+
+  test("admin mutations reject untrusted origins without changing storage", async ({ page }) => {
+    await page.goto("/admin/login");
+    const baseURL = new URL(page.url()).origin;
+    await page.locator('input[type="password"]').fill(e2eAdminPassword());
+    await page.getByRole("button", { name: /登录后台|sudo/i }).click();
+    await expect(page).toHaveURL(/\/admin$/);
+
+    const session = (await page.context().cookies()).find(
+      (cookie) => cookie.name === "isme_admin_session",
+    );
+    expect(session?.value).toBeTruthy();
+    const authenticatedApi = await playwrightRequest.newContext({
+      baseURL,
+      extraHTTPHeaders: { Cookie: `${session!.name}=${session!.value}` },
+    });
+    try {
+      const beforeResponse = await authenticatedApi.get("/api/admin/profile");
+      expect(beforeResponse.status()).toBe(200);
+      const before = await beforeResponse.json();
+      const attemptedProfile = {
+        ...before.profile,
+        displayName: `cross-origin-write-${Date.now()}`,
+      };
+      const attempts: Array<{ label: string; headers?: Record<string, string> }> = [
+        { label: "missing Origin" },
+        { label: "opaque Origin", headers: { origin: "null" } },
+        { label: "cross-origin", headers: { origin: "https://attacker.example" } },
+        {
+          label: "forged forwarded host",
+          headers: {
+            origin: "https://attacker.example",
+            "x-forwarded-host": "attacker.example",
+          },
+        },
+      ];
+
+      for (const attempt of attempts) {
+        const response = await authenticatedApi.put("/api/admin/profile", {
+          data: attemptedProfile,
+          headers: attempt.headers,
+        });
+        expect(response.status(), attempt.label).toBe(403);
+        expect(response.headers()["cache-control"], attempt.label).toContain("private");
+        expect(response.headers()["cache-control"], attempt.label).toContain("no-store");
+      }
+
+      const afterResponse = await authenticatedApi.get("/api/admin/profile");
+      expect(afterResponse.status()).toBe(200);
+      expect(await afterResponse.json()).toEqual(before);
+    } finally {
+      await authenticatedApi.dispose();
+    }
   });
 
   test("admin readiness gate catches demo content and exports a report", async ({ page }) => {
@@ -493,6 +549,7 @@ test.describe("IsMe smoke", () => {
 
     const login = await page.request.post("/api/admin/login", {
       data: { password: e2eAdminPassword() },
+      headers: { origin: baseURL },
     });
     expect(login.status()).toBe(200);
     const oldSession = (await page.context().cookies()).find(
@@ -551,7 +608,17 @@ test.describe("IsMe smoke", () => {
         });
         return response.status;
       }, password);
-    expect(await loginFromBrowser(e2eAdminPassword())).toBe(401);
+    const rejectedOldPassword = await page.evaluate(async (password) => {
+      const response = await fetch("/api/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+      });
+      return { status: response.status, cacheControl: response.headers.get("cache-control") };
+    }, e2eAdminPassword());
+    expect(rejectedOldPassword.status).toBe(401);
+    expect(rejectedOldPassword.cacheControl).toContain("private");
+    expect(rejectedOldPassword.cacheControl).toContain("no-store");
     expect(await loginFromBrowser(newPassword)).toBe(200);
     const newSession = (await page.context().cookies()).find(
       (cookie) => cookie.name === "isme_admin_session",

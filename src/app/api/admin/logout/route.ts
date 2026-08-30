@@ -6,7 +6,7 @@ import { clearAdminSession } from "@/lib/auth/session";
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
-  const denied = await requireAdmin();
+  const denied = await requireAdmin(request);
   if (denied) return denied;
 
   await clearAdminSession();

@@ -6,6 +6,8 @@ import {
   verifyAdminSessionToken,
 } from "@/lib/auth/session-cookie";
 
+const PRIVATE_NO_STORE = "private, no-store, max-age=0";
+
 function applySecurityHeaders(response: NextResponse) {
   response.headers.set("X-Content-Type-Options", "nosniff");
   response.headers.set("X-Frame-Options", "DENY");
@@ -35,6 +37,11 @@ function applySecurityHeaders(response: NextResponse) {
   return response;
 }
 
+function adminRejection(response: NextResponse) {
+  response.headers.set("Cache-Control", PRIVATE_NO_STORE);
+  return applySecurityHeaders(response);
+}
+
 async function hasValidAdminSession(request: NextRequest): Promise<boolean> {
   const token = request.cookies.get(ADMIN_SESSION_COOKIE)?.value;
   if (!token) return false;
@@ -52,11 +59,11 @@ function denyAdminIp(request: NextRequest): NextResponse | null {
   if (isAdminIpAllowedForRequest(request.headers)) return null;
 
   if (request.nextUrl.pathname.startsWith("/api/")) {
-    return applySecurityHeaders(
+    return adminRejection(
       NextResponse.json({ error: "Forbidden", code: "IP_NOT_ALLOWED" }, { status: 403 }),
     );
   }
-  return applySecurityHeaders(
+  return adminRejection(
     new NextResponse("Forbidden: admin IP not allowlisted", { status: 403 }),
   );
 }
@@ -77,7 +84,7 @@ export async function proxy(request: NextRequest) {
 
   if (pathname.startsWith("/api/admin") && !pathname.startsWith("/api/admin/login")) {
     if (!(await hasValidAdminSession(request))) {
-      return applySecurityHeaders(
+      return adminRejection(
         NextResponse.json({ error: "Unauthorized" }, { status: 401 }),
       );
     }

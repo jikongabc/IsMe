@@ -7,6 +7,7 @@ import {
 } from "@/lib/auth/password";
 import { requireAdmin } from "@/lib/auth/require-admin";
 import { clearAdminSession } from "@/lib/auth/session";
+import { privateJson } from "@/lib/http/admin-request";
 import { changePasswordSchema } from "@/lib/validators";
 
 export const runtime = "nodejs";
@@ -21,7 +22,7 @@ export async function GET() {
 }
 
 export async function PUT(request: Request) {
-  const denied = await requireAdmin();
+  const denied = await requireAdmin(request);
   if (denied) return denied;
 
   let body: unknown;
@@ -46,7 +47,7 @@ export async function PUT(request: Request) {
       ok: false,
       detail: { reason: "bad_current" },
     });
-    return NextResponse.json({ error: "Current password is incorrect" }, { status: 401 });
+    return privateJson({ error: "Current password is incorrect" }, { status: 401 });
   }
 
   await clearAdminSession();
