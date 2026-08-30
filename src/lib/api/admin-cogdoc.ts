@@ -17,7 +17,7 @@ export function cogdocErrorResponse(error: unknown) {
     );
   }
   return NextResponse.json(
-    { error: error instanceof Error ? error.message : "Unexpected error", code: "INTERNAL_ERROR" },
+    { error: "Unexpected server error", code: "INTERNAL_ERROR" },
     { status: 500 },
   );
 }

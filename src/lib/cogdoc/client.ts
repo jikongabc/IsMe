@@ -1,8 +1,12 @@
-import { getEnv, isCogDocConfigured } from "@/lib/env";
+import { isCogDocConfigured } from "@/lib/env";
+import {
+  cogdocRequest,
+  CogDocRequestError,
+  sanitizeCogDocData,
+} from "./request";
 import { buildDemoAnswer, normalizeChatResponse } from "./normalize";
 import type {
   CogDocChatResponse,
-  CogDocErrorBody,
   NormalizedChatResult,
 } from "./types";
 
@@ -17,15 +21,41 @@ export type {
 export class CogDocClientError extends Error {
   status: number;
   code: string;
-  details?: unknown;
-
-  constructor(status: number, code: string, message: string, details?: unknown) {
-    super(message);
+  constructor(status: number, code: string, _message?: string) {
+    void _message;
+    const safe = safeClientError(code);
+    super(safe.message);
     this.name = "CogDocClientError";
     this.status = status;
-    this.code = code;
-    this.details = details;
+    this.code = safe.code;
   }
+}
+
+function safeClientError(code: string): { code: string; message: string } {
+  switch (code) {
+    case "LLM_TIMEOUT":
+      return { code, message: "CogDoc request timed out" };
+    case "MODEL_UNAVAILABLE":
+      return { code, message: "CogDoc service is unavailable" };
+    case "COGDOC_REDIRECT_BLOCKED":
+      return { code, message: "CogDoc redirect was blocked" };
+    case "COGDOC_STREAM_ERROR":
+      return { code, message: "CogDoc stream failed" };
+    case "COGDOC_UPSTREAM_ERROR":
+      return { code, message: "CogDoc request failed" };
+    default:
+      return { code: "COGDOC_ERROR", message: "CogDoc request failed" };
+  }
+}
+
+function clientErrorFromRequest(error: CogDocRequestError): CogDocClientError {
+  if (error.code === "COGDOC_TIMEOUT") {
+    return new CogDocClientError(504, "LLM_TIMEOUT");
+  }
+  if (error.code === "COGDOC_REDIRECT_BLOCKED") {
+    return new CogDocClientError(502, "COGDOC_REDIRECT_BLOCKED");
+  }
+  return new CogDocClientError(502, "MODEL_UNAVAILABLE");
 }
 
 export type ChatParams = {
@@ -44,17 +74,6 @@ export type StreamEvent =
   | { type: "final"; result: NormalizedChatResult }
   | { type: "error"; code: string; message: string };
 
-function authHeaders(): Record<string, string> {
-  const env = getEnv();
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (env.COGDOC_API_KEY) {
-    headers.Authorization = `Bearer ${env.COGDOC_API_KEY}`;
-  }
-  return headers;
-}
-
 function chatBody(params: ChatParams) {
   return {
     schema_version: "v1",
@@ -71,44 +90,23 @@ export async function chatWithCogDoc(params: ChatParams): Promise<NormalizedChat
     return buildDemoAnswer(params.publicId ?? "portfolio", params.query);
   }
 
-  const env = getEnv();
-  const base = env.COGDOC_API_URL.replace(/\/$/, "");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), env.COGDOC_TIMEOUT_MS);
-
   try {
-    const res = await fetch(`${base}/v1/chat`, {
+    const res = await cogdocRequest("/v1/chat", {
       method: "POST",
-      headers: authHeaders(),
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(chatBody(params)),
-      signal: controller.signal,
     });
 
-    const data = (await res.json()) as CogDocChatResponse | CogDocErrorBody;
-
     if (!res.ok) {
-      const err = data as CogDocErrorBody;
-      throw new CogDocClientError(
-        res.status,
-        err.error_code ?? "COGDOC_ERROR",
-        err.message ?? `CogDoc request failed with status ${res.status}`,
-        err,
-      );
+      throw new CogDocClientError(502, "COGDOC_UPSTREAM_ERROR");
     }
 
-    return normalizeChatResponse(data as CogDocChatResponse);
+    const data = sanitizeCogDocData((await res.json()) as CogDocChatResponse);
+    return sanitizeCogDocData(normalizeChatResponse(data));
   } catch (error) {
     if (error instanceof CogDocClientError) throw error;
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new CogDocClientError(504, "LLM_TIMEOUT", "CogDoc request timed out");
-    }
-    throw new CogDocClientError(
-      502,
-      "MODEL_UNAVAILABLE",
-      error instanceof Error ? error.message : "Failed to reach CogDoc",
-    );
-  } finally {
-    clearTimeout(timer);
+    if (error instanceof CogDocRequestError) throw clientErrorFromRequest(error);
+    throw new CogDocClientError(502, "MODEL_UNAVAILABLE");
   }
 }
 
@@ -158,33 +156,18 @@ export async function* streamChatWithCogDoc(
     return;
   }
 
-  const env = getEnv();
-  const base = env.COGDOC_API_URL.replace(/\/$/, "");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), env.COGDOC_TIMEOUT_MS);
-
   try {
-    const res = await fetch(`${base}/v1/chat/stream`, {
+    const res = await cogdocRequest("/v1/chat/stream", {
       method: "POST",
       headers: {
-        ...authHeaders(),
+        "Content-Type": "application/json",
         Accept: "text/event-stream",
       },
       body: JSON.stringify(chatBody(params)),
-      signal: controller.signal,
     });
 
     if (!res.ok || !res.body) {
-      let message = `CogDoc stream failed with status ${res.status}`;
-      let code = "COGDOC_ERROR";
-      try {
-        const err = (await res.json()) as CogDocErrorBody;
-        message = err.message ?? message;
-        code = err.error_code ?? code;
-      } catch {
-        // ignore
-      }
-      yield { type: "error", code, message };
+      yield { type: "error", ...safeClientError("COGDOC_STREAM_ERROR") };
       return;
     }
 
@@ -202,7 +185,9 @@ export async function* streamChatWithCogDoc(
       for (const frame of parsed.frames) {
         let payload: Record<string, unknown> = {};
         try {
-          payload = JSON.parse(frame.data) as Record<string, unknown>;
+          payload = sanitizeCogDocData(
+            JSON.parse(frame.data) as Record<string, unknown>,
+          );
         } catch {
           continue;
         }
@@ -225,24 +210,22 @@ export async function* streamChatWithCogDoc(
         } else if (frame.event === "error") {
           yield {
             type: "error",
-            code: String(payload.error_code ?? "COGDOC_ERROR"),
-            message: String(payload.message ?? "CogDoc stream error"),
+            ...safeClientError("COGDOC_STREAM_ERROR"),
           };
         }
       }
     }
   } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      yield { type: "error", code: "LLM_TIMEOUT", message: "CogDoc request timed out" };
+    if (error instanceof CogDocRequestError) {
+      const safe = clientErrorFromRequest(error);
+      yield { type: "error", code: safe.code, message: safe.message };
       return;
     }
     yield {
       type: "error",
       code: "MODEL_UNAVAILABLE",
-      message: error instanceof Error ? error.message : "Failed to reach CogDoc",
+      message: "CogDoc service is unavailable",
     };
-  } finally {
-    clearTimeout(timer);
   }
 }
 

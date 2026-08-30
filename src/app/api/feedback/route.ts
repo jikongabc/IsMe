@@ -2,8 +2,13 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { tryRecordAnswerFeedback } from "@/lib/analytics/chat-events";
 import { clientIpFromRequest } from "@/lib/auth/client-ip";
+import {
+  cogdocRequest,
+  CogDocRequestError,
+  sanitizeCogDocData,
+} from "@/lib/cogdoc/request";
 import { getEnabledKbBySlug } from "@/lib/content/queries";
-import { getEnv, isCogDocConfigured } from "@/lib/env";
+import { isCogDocConfigured } from "@/lib/env";
 import { takeToken } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
@@ -64,15 +69,10 @@ export async function POST(request: Request) {
     });
   }
 
-  const env = getEnv();
-  const base = env.COGDOC_API_URL.replace(/\/$/, "");
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (env.COGDOC_API_KEY) headers.Authorization = `Bearer ${env.COGDOC_API_KEY}`;
-
   try {
-    const res = await fetch(`${base}/v1/feedback`, {
+    const res = await cogdocRequest("/v1/feedback", {
       method: "POST",
-      headers,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         schema_version: "v1",
         trace_id: parsed.data.traceId,
@@ -84,25 +84,19 @@ export async function POST(request: Request) {
         comment: parsed.data.comment,
         feedback_type: parsed.data.feedbackType,
       }),
-      signal: AbortSignal.timeout(15_000),
     });
-
-    const data = (await res.json()) as {
-      feedback_id?: string;
-      status?: string;
-      message?: string;
-      error_code?: string;
-    };
 
     if (!res.ok) {
       return NextResponse.json(
-        {
-          error: data.message ?? "Feedback failed",
-          code: data.error_code ?? "COGDOC_ERROR",
-        },
-        { status: res.status },
+        { error: "CogDoc request failed", code: "COGDOC_UPSTREAM_ERROR" },
+        { status: 502 },
       );
     }
+
+    const data = sanitizeCogDocData((await res.json()) as {
+      feedback_id?: string;
+      status?: string;
+    });
 
     tryRecordAnswerFeedback({
       moduleSlug: parsed.data.moduleSlug,
@@ -119,9 +113,15 @@ export async function POST(request: Request) {
       feedbackId: data.feedback_id,
     });
   } catch (error) {
+    if (error instanceof CogDocRequestError) {
+      return NextResponse.json(
+        { error: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
     return NextResponse.json(
       {
-        error: error instanceof Error ? error.message : "Failed to reach CogDoc",
+        error: "CogDoc service is unavailable",
         code: "MODEL_UNAVAILABLE",
       },
       { status: 502 },
