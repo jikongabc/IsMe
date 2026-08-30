@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { tryAuditRequest } from "@/lib/audit/log";
 import { clientIpFromRequest } from "@/lib/auth/client-ip";
-import { createAdminSession, verifyAdminPassword } from "@/lib/auth/session";
+import { authenticateAdminPassword } from "@/lib/auth/password";
+import { createAdminSession } from "@/lib/auth/session";
 import { takeToken } from "@/lib/rate-limit";
 import { loginSchema } from "@/lib/validators";
 
@@ -28,12 +29,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Invalid credentials payload" }, { status: 400 });
   }
 
-  if (!verifyAdminPassword(parsed.data.password)) {
+  const sessionVersion = authenticateAdminPassword(parsed.data.password);
+  if (sessionVersion === null) {
     tryAuditRequest(request, { action: "auth.login", ok: false, detail: { reason: "bad_password" } });
     return NextResponse.json({ error: "Invalid password" }, { status: 401 });
   }
 
-  await createAdminSession();
+  await createAdminSession(sessionVersion);
   tryAuditRequest(request, { action: "auth.login", ok: true });
   return NextResponse.json({ ok: true });
 }

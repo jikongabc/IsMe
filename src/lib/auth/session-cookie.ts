@@ -6,6 +6,7 @@ export const ADMIN_SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
 export type AdminSessionPayload = {
   role: "admin";
   exp: number;
+  version: number;
 };
 
 /** Decode base64url to bytes (Edge + Node). */
@@ -32,7 +33,14 @@ export function utf8FromBase64Url(value: string): string {
 export function parseSessionBody(body: string): AdminSessionPayload | null {
   try {
     const payload = JSON.parse(utf8FromBase64Url(body)) as AdminSessionPayload;
-    if (payload.role !== "admin" || typeof payload.exp !== "number") return null;
+    if (
+      payload.role !== "admin" ||
+      typeof payload.exp !== "number" ||
+      !Number.isSafeInteger(payload.version) ||
+      payload.version <= 0
+    ) {
+      return null;
+    }
     if (Date.now() > payload.exp) return null;
     return payload;
   } catch {
