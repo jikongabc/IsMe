@@ -46,10 +46,10 @@ export async function POST(request: Request) {
             push("error", { code: event.code, error: event.message });
           }
         }
-      } catch (error) {
+      } catch {
         push("error", {
           code: "INTERNAL_ERROR",
-          error: error instanceof Error ? error.message : "Unexpected stream error",
+          error: "Unexpected stream error",
         });
       } finally {
         controller.close();

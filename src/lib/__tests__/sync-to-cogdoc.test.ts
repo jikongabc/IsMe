@@ -7,6 +7,7 @@ const cogdoc = vi.hoisted(() => ({
   deleteDerivedKnowledge: vi.fn(),
   ensureKnowledgeBase: vi.fn(),
   listDerivedKnowledge: vi.fn(),
+  CogDocAdminError: class CogDocAdminError extends Error {},
 }));
 
 vi.mock("@/lib/cogdoc/admin-client", () => cogdoc);

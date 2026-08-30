@@ -1,6 +1,7 @@
 import {
   approveDerivedKnowledge,
   batchApproveDerivedKnowledge,
+  CogDocAdminError,
   createDerivedKnowledge,
   deleteDerivedKnowledge,
   ensureKnowledgeBase,
@@ -29,6 +30,10 @@ export type ContentSyncResult = {
   failed: number;
   items: SyncItemResult[];
 };
+
+function safeSyncError(error: unknown, fallback: string): string {
+  return error instanceof CogDocAdminError ? error.message : fallback;
+}
 
 export async function syncCardsToCogDoc(
   kbId: string,
@@ -103,7 +108,7 @@ export async function syncCardsToCogDoc(
         title: card?.title ?? key,
         status: "failed",
         knowledgeId: row.knowledge_id,
-        error: error instanceof Error ? error.message : "remove stale knowledge failed",
+        error: safeSyncError(error, "remove stale knowledge failed"),
       });
     }
   }
@@ -151,7 +156,7 @@ export async function syncCardsToCogDoc(
         key: card.key,
         title: card.title,
         status: "failed",
-        error: error instanceof Error ? error.message : "sync failed",
+        error: safeSyncError(error, "sync failed"),
       });
     }
   }
@@ -174,7 +179,7 @@ export async function syncCardsToCogDoc(
           const item = items.find((row) => row.knowledgeId === knowledgeId);
           if (item) {
             item.status = "failed";
-            item.error = error instanceof Error ? error.message : "approve failed";
+            item.error = safeSyncError(error, "approve failed");
           }
         }
       }

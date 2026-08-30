@@ -4,10 +4,12 @@ const envMocks = vi.hoisted(() => ({
   getEnv: vi.fn(() => ({
     COGDOC_API_URL: "https://cogdoc.internal",
     COGDOC_API_KEY: "test-service-key",
+    COGDOC_TIMEOUT_MS: 8_000,
   })),
   isCogDocConfigured: vi.fn(() => true),
 }));
 
+vi.mock("server-only", () => ({}));
 vi.mock("@/lib/env", () => envMocks);
 
 import {

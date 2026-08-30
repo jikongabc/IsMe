@@ -39,6 +39,8 @@ npm run dev
 
 未配置 `COGDOC_API_URL` 时，问答与反馈走演示模式，站点其余功能仍可用。
 
+`COGDOC_API_URL` 必须是单一 `http(s)` origin（例如 `https://cogdoc.example.com`），不能包含路径、查询、片段或 `user:password@host` 凭据。生产环境默认只允许 HTTPS；只有部署所有者已确认 CogDoc 位于同机或受控私网、且接受链路明文风险时，才可在服务端环境显式设置 `COGDOC_ALLOW_INSECURE_HTTP=true`。该开关默认关闭，也不能由任何请求字段覆盖。所有 CogDoc 请求共用 `COGDOC_TIMEOUT_MS`，并拒绝跟随任何上游重定向。
+
 ### Launch Studio：把模板内容换成你的内容
 
 首次登录后打开 `/admin/setup`。Launch Studio 把原本分散在资料、经历、项目、文章与外观页面的初始化工作组织成一次可预览的数据迁移：

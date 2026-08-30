@@ -1,4 +1,9 @@
 import { getEnv, isCogDocConfigured } from "@/lib/env";
+import {
+  cogdocRequest,
+  CogDocRequestError,
+  sanitizeCogDocData,
+} from "@/lib/cogdoc/request";
 
 export type CogDocKb = {
   kb_id: string;
@@ -27,41 +32,52 @@ export class CogDocAdminError extends Error {
   status: number;
   code: string;
 
-  constructor(status: number, code: string, message: string) {
-    super(message);
+  constructor(status: number, code: string, _message?: string) {
+    void _message;
+    const safe = safeAdminError(code);
+    super(safe.message);
     this.name = "CogDocAdminError";
     this.status = status;
-    this.code = code;
+    this.code = safe.code;
   }
 }
 
-function requireConfigured(): { base: string; headers: Record<string, string> } {
-  if (!isCogDocConfigured()) {
-    throw new CogDocAdminError(
-      503,
-      "COGDOC_NOT_CONFIGURED",
-      "COGDOC_API_URL is empty — configure CogDoc in .env first",
-    );
+function safeAdminError(code: string): { code: string; message: string } {
+  switch (code) {
+    case "COGDOC_NOT_CONFIGURED":
+      return { code, message: "CogDoc is not configured" };
+    case "COGDOC_REDIRECT_BLOCKED":
+      return { code, message: "CogDoc redirect was blocked" };
+    case "COGDOC_TIMEOUT":
+      return { code, message: "CogDoc request timed out" };
+    case "COGDOC_UNAVAILABLE":
+      return { code, message: "CogDoc service is unavailable" };
+    case "COGDOC_UPSTREAM_ERROR":
+      return { code, message: "CogDoc request failed" };
+    default:
+      return { code: "COGDOC_ERROR", message: "CogDoc request failed" };
   }
-  const env = getEnv();
-  const headers: Record<string, string> = {};
-  if (env.COGDOC_API_KEY) {
-    headers.Authorization = `Bearer ${env.COGDOC_API_KEY}`;
+}
+
+function rethrowAdminRequestError(error: unknown): never {
+  if (error instanceof CogDocRequestError) {
+    throw new CogDocAdminError(error.status, error.code);
   }
-  return { base: env.COGDOC_API_URL.replace(/\/$/, ""), headers };
+  throw new CogDocAdminError(502, "COGDOC_UNAVAILABLE");
 }
 
 async function parseError(res: Response): Promise<CogDocAdminError> {
-  try {
-    const body = (await res.json()) as { error_code?: string; message?: string };
-    return new CogDocAdminError(
-      res.status,
-      body.error_code ?? "COGDOC_ERROR",
-      body.message ?? `CogDoc request failed (${res.status})`,
-    );
-  } catch {
-    return new CogDocAdminError(res.status, "COGDOC_ERROR", `CogDoc request failed (${res.status})`);
-  }
+  return new CogDocAdminError(res.status, "COGDOC_UPSTREAM_ERROR");
+}
+
+function normalizeIndexJob(job: CogDocIndexJob): CogDocIndexJob {
+  return {
+    ...job,
+    message: job.message
+      ? (job.status === "failed" ? "CogDoc job failed" : "CogDoc job status updated")
+      : null,
+    error_code: job.error_code ? "COGDOC_JOB_ERROR" : job.error_code,
+  };
 }
 
 export async function checkCogDocHealth(signal?: AbortSignal): Promise<{
@@ -73,21 +89,26 @@ export async function checkCogDocHealth(signal?: AbortSignal): Promise<{
   if (!isCogDocConfigured()) {
     return { ok: false, demo: true, detail: "COGDOC_API_URL not configured" };
   }
-  const { base, headers } = requireConfigured();
   try {
-    const res = await fetch(`${base}/healthz`, {
-      headers,
-      signal: signal ?? AbortSignal.timeout(8_000),
-    });
+    const res = await cogdocRequest("/healthz", { signal })
+      .catch(rethrowAdminRequestError);
     if (!res.ok) {
-      return { ok: false, demo: false, status: res.status, detail: `healthz ${res.status}` };
+      return {
+        ok: false,
+        demo: false,
+        status: res.status,
+        detail: "CogDoc health check failed",
+      };
     }
     return { ok: true, demo: false, status: res.status };
   } catch (error) {
     return {
       ok: false,
       demo: false,
-      detail: error instanceof Error ? error.message : "unreachable",
+      status: error instanceof CogDocAdminError ? error.status : undefined,
+      detail: error instanceof CogDocAdminError
+        ? error.message
+        : "CogDoc service is unavailable",
     };
   }
 }
@@ -96,29 +117,26 @@ export async function getKnowledgeBase(
   kbId: string,
   signal?: AbortSignal,
 ): Promise<CogDocKb | null> {
-  const { base, headers } = requireConfigured();
-  const res = await fetch(`${base}/v1/knowledge-bases/${encodeURIComponent(kbId)}`, {
-    headers,
+  const res = await cogdocRequest(`/v1/knowledge-bases/${encodeURIComponent(kbId)}`, {
     signal,
-  });
+  }).catch(rethrowAdminRequestError);
   if (res.status === 404) return null;
   if (!res.ok) throw await parseError(res);
-  return (await res.json()) as CogDocKb;
+  return sanitizeCogDocData((await res.json()) as CogDocKb);
 }
 
 export async function createKnowledgeBase(kbId: string): Promise<CogDocKb> {
-  const { base, headers } = requireConfigured();
-  const res = await fetch(`${base}/v1/knowledge-bases`, {
+  const res = await cogdocRequest("/v1/knowledge-bases", {
     method: "POST",
-    headers: { ...headers, "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ kb_id: kbId }),
-  });
+  }).catch(rethrowAdminRequestError);
   if (res.status === 409) {
     const existing = await getKnowledgeBase(kbId);
     if (existing) return existing;
   }
   if (!res.ok) throw await parseError(res);
-  return (await res.json()) as CogDocKb;
+  return sanitizeCogDocData((await res.json()) as CogDocKb);
 }
 
 /** Ensure the CogDoc KB exists; create when missing. */
@@ -133,13 +151,11 @@ export async function ensureKnowledgeBase(kbId: string): Promise<{
 }
 
 export async function listDocuments(kbId: string): Promise<CogDocDocument[]> {
-  const { base, headers } = requireConfigured();
-  const res = await fetch(
-    `${base}/v1/knowledge-bases/${encodeURIComponent(kbId)}/documents`,
-    { headers },
-  );
+  const res = await cogdocRequest(
+    `/v1/knowledge-bases/${encodeURIComponent(kbId)}/documents`,
+  ).catch(rethrowAdminRequestError);
   if (!res.ok) throw await parseError(res);
-  return (await res.json()) as CogDocDocument[];
+  return sanitizeCogDocData((await res.json()) as CogDocDocument[]);
 }
 
 export async function uploadDocument(
@@ -147,41 +163,41 @@ export async function uploadDocument(
   file: Blob,
   filename: string,
 ): Promise<CogDocIndexJob> {
-  const { base, headers } = requireConfigured();
   const form = new FormData();
   form.append("file", file, filename);
-  const res = await fetch(
-    `${base}/v1/knowledge-bases/${encodeURIComponent(kbId)}/documents`,
+  const res = await cogdocRequest(
+    `/v1/knowledge-bases/${encodeURIComponent(kbId)}/documents`,
     {
       method: "POST",
-      headers,
       body: form,
     },
-  );
+  ).catch(rethrowAdminRequestError);
   if (!res.ok) throw await parseError(res);
-  return (await res.json()) as CogDocIndexJob;
+  return normalizeIndexJob(
+    sanitizeCogDocData((await res.json()) as CogDocIndexJob),
+  );
 }
 
 export async function deleteDocument(kbId: string, name: string): Promise<CogDocIndexJob> {
-  const { base, headers } = requireConfigured();
-  const res = await fetch(
-    `${base}/v1/knowledge-bases/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(name)}`,
+  const res = await cogdocRequest(
+    `/v1/knowledge-bases/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(name)}`,
     {
       method: "DELETE",
-      headers,
     },
-  );
+  ).catch(rethrowAdminRequestError);
   if (!res.ok) throw await parseError(res);
-  return (await res.json()) as CogDocIndexJob;
+  return normalizeIndexJob(
+    sanitizeCogDocData((await res.json()) as CogDocIndexJob),
+  );
 }
 
 export async function getIndexJob(jobId: string): Promise<CogDocIndexJob> {
-  const { base, headers } = requireConfigured();
-  const res = await fetch(`${base}/v1/index-jobs/${encodeURIComponent(jobId)}`, {
-    headers,
-  });
+  const res = await cogdocRequest(`/v1/index-jobs/${encodeURIComponent(jobId)}`)
+    .catch(rethrowAdminRequestError);
   if (!res.ok) throw await parseError(res);
-  return (await res.json()) as CogDocIndexJob;
+  return normalizeIndexJob(
+    sanitizeCogDocData((await res.json()) as CogDocIndexJob),
+  );
 }
 
 export type DerivedKnowledgeCreateResult = {
@@ -204,15 +220,15 @@ export async function listDerivedKnowledge(
   createdBy?: string,
   signal?: AbortSignal,
 ): Promise<CogDocDerivedKnowledge[]> {
-  const { base, headers } = requireConfigured();
   const params = new URLSearchParams({ kb_id: kbId });
   if (createdBy) params.set("created_by", createdBy);
-  const res = await fetch(`${base}/v1/knowledge?${params.toString()}`, {
-    headers,
+  const res = await cogdocRequest(`/v1/knowledge?${params.toString()}`, {
     signal,
-  });
+  }).catch(rethrowAdminRequestError);
   if (!res.ok) throw await parseError(res);
-  const data = (await res.json()) as { knowledge?: CogDocDerivedKnowledge[] };
+  const data = sanitizeCogDocData(
+    (await res.json()) as { knowledge?: CogDocDerivedKnowledge[] },
+  );
   return data.knowledge ?? [];
 }
 
@@ -234,7 +250,7 @@ export async function checkCogDocReadiness(
   kbIds: string[],
 ): Promise<CogDocReadinessResult> {
   const uniqueIds = [...new Set(kbIds.map((id) => id.trim()).filter(Boolean))];
-  const signal = AbortSignal.timeout(8_000);
+  const signal = AbortSignal.timeout(getEnv().COGDOC_TIMEOUT_MS);
   const health = await checkCogDocHealth(signal);
   if (!health.ok) {
     return {
@@ -285,11 +301,9 @@ export async function checkCogDocReadiness(
 }
 
 export async function deleteDerivedKnowledge(knowledgeId: string): Promise<void> {
-  const { base, headers } = requireConfigured();
-  const res = await fetch(`${base}/v1/knowledge/${encodeURIComponent(knowledgeId)}`, {
+  const res = await cogdocRequest(`/v1/knowledge/${encodeURIComponent(knowledgeId)}`, {
     method: "DELETE",
-    headers,
-  });
+  }).catch(rethrowAdminRequestError);
   if (!res.ok && res.status !== 404) throw await parseError(res);
 }
 
@@ -298,10 +312,9 @@ export async function createDerivedKnowledge(input: {
   text: string;
   sourceNote: string;
 }): Promise<DerivedKnowledgeCreateResult> {
-  const { base, headers } = requireConfigured();
-  const res = await fetch(`${base}/v1/knowledge`, {
+  const res = await cogdocRequest("/v1/knowledge", {
     method: "POST",
-    headers: { ...headers, "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       schema_version: "v1",
       kb_id: input.kbId,
@@ -311,12 +324,14 @@ export async function createDerivedKnowledge(input: {
       origin: "manual_entry",
       created_by: "isme-sync",
     }),
-  });
+  }).catch(rethrowAdminRequestError);
   if (!res.ok) throw await parseError(res);
-  const data = (await res.json()) as {
-    knowledge?: { knowledge_id?: string; status?: string };
-    deduplicated?: boolean;
-  };
+  const data = sanitizeCogDocData(
+    (await res.json()) as {
+      knowledge?: { knowledge_id?: string; status?: string };
+      deduplicated?: boolean;
+    },
+  );
   return {
     knowledgeId: data.knowledge?.knowledge_id ?? "",
     status: data.knowledge?.status ?? "pending",
@@ -325,34 +340,32 @@ export async function createDerivedKnowledge(input: {
 }
 
 export async function approveDerivedKnowledge(knowledgeId: string): Promise<void> {
-  const { base, headers } = requireConfigured();
-  const res = await fetch(
-    `${base}/v1/knowledge/${encodeURIComponent(knowledgeId)}/approve`,
+  const res = await cogdocRequest(
+    `/v1/knowledge/${encodeURIComponent(knowledgeId)}/approve`,
     {
       method: "POST",
-      headers: { ...headers, "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         schema_version: "v1",
         actor: "isme-sync",
         note: "auto-approved from IsMe content sync",
       }),
     },
-  );
+  ).catch(rethrowAdminRequestError);
   if (!res.ok) throw await parseError(res);
 }
 
 export async function batchApproveDerivedKnowledge(knowledgeIds: string[]): Promise<void> {
   if (knowledgeIds.length === 0) return;
-  const { base, headers } = requireConfigured();
-  const res = await fetch(`${base}/v1/knowledge/batch-approve`, {
+  const res = await cogdocRequest("/v1/knowledge/batch-approve", {
     method: "POST",
-    headers: { ...headers, "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       schema_version: "v1",
       actor: "isme-sync",
       note: "batch auto-approve from IsMe content sync",
       knowledge_ids: knowledgeIds,
     }),
-  });
+  }).catch(rethrowAdminRequestError);
   if (!res.ok) throw await parseError(res);
 }
