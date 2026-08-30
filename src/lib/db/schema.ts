@@ -52,6 +52,8 @@ export const siteProfiles = sqliteTable("site_profiles", {
     .default({}),
   /** Optional bcrypt/scrypt hash; empty = use ADMIN_PASSWORD env. */
   adminPasswordHash: text("admin_password_hash").notNull().default(""),
+  /** Monotonic credential generation embedded in every admin session. */
+  adminSessionVersion: integer("admin_session_version").notNull().default(0),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });
@@ -267,7 +269,11 @@ export const mediaAssets = sqliteTable("media_assets", {
   createdAt: text("created_at").notNull(),
 });
 
-export type SiteProfile = typeof siteProfiles.$inferSelect;
+type StoredSiteProfile = typeof siteProfiles.$inferSelect;
+/** Content consumers may omit the auth-only generation from fixtures and projections. */
+export type SiteProfile = Omit<StoredSiteProfile, "adminSessionVersion"> & {
+  adminSessionVersion?: number;
+};
 export type SocialLink = typeof socialLinks.$inferSelect;
 export type FocusArea = typeof focusAreas.$inferSelect;
 export type Experience = typeof experiences.$inferSelect;

@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { randomInt } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS site_profiles (
   default_locale TEXT NOT NULL DEFAULT 'zh',
   theme_config TEXT NOT NULL DEFAULT '{}',
   admin_password_hash TEXT NOT NULL DEFAULT '',
+  admin_session_version INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -254,6 +256,24 @@ export function ensureSchema(sqlite: Database.Database): void {
     ensureColumn(sqlite, "site_profiles", "introduction_en", "TEXT NOT NULL DEFAULT ''");
     ensureColumn(sqlite, "site_profiles", "availability_en", "TEXT NOT NULL DEFAULT ''");
     ensureColumn(sqlite, "site_profiles", "admin_password_hash", "TEXT NOT NULL DEFAULT ''");
+    ensureColumn(sqlite, "site_profiles", "admin_session_version", "INTEGER NOT NULL DEFAULT 0");
+    // A cryptographically random positive starting point rejects all
+    // pre-version cookies without giving every upgraded installation the same
+    // credential generation. The WHERE clause keeps reruns idempotent.
+    const profilesWithoutSessionVersion = sqlite
+      .prepare("SELECT id FROM site_profiles WHERE admin_session_version <= 0")
+      .all() as Array<{ id: string }>;
+    const setInitialSessionVersion = sqlite.prepare(
+      `UPDATE site_profiles
+       SET admin_session_version = ?
+       WHERE id = ? AND admin_session_version <= 0`,
+    );
+    for (const profile of profilesWithoutSessionVersion) {
+      setInitialSessionVersion.run(
+        randomInt(1_000_000_000, 2_000_000_000),
+        profile.id,
+      );
+    }
     ensureColumn(sqlite, "experiences", "organization_en", "TEXT NOT NULL DEFAULT ''");
     ensureColumn(sqlite, "experiences", "role_en", "TEXT NOT NULL DEFAULT ''");
     ensureColumn(sqlite, "experiences", "description_en", "TEXT NOT NULL DEFAULT ''");

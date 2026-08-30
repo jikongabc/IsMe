@@ -15,7 +15,7 @@ function nodeSign(body: string): string {
 describe("session cookie crypto", () => {
   it("matches Node HMAC base64url", async () => {
     const body = Buffer.from(
-      JSON.stringify({ role: "admin", exp: Date.now() + 60_000 }),
+      JSON.stringify({ role: "admin", exp: Date.now() + 60_000, version: 17 }),
     ).toString("base64url");
     const edge = await hmacSha256Base64Url(body, SECRET);
     expect(edge).toBe(nodeSign(body));
@@ -23,7 +23,7 @@ describe("session cookie crypto", () => {
 
   it("verifies a Node-issued token", async () => {
     const body = Buffer.from(
-      JSON.stringify({ role: "admin", exp: Date.now() + 60_000 }),
+      JSON.stringify({ role: "admin", exp: Date.now() + 60_000, version: 17 }),
     ).toString("base64url");
     const token = `${body}.${nodeSign(body)}`;
     expect(await verifyAdminSessionToken(token, SECRET)).toBe(true);
@@ -31,7 +31,7 @@ describe("session cookie crypto", () => {
 
   it("rejects forged or expired tokens", async () => {
     const body = Buffer.from(
-      JSON.stringify({ role: "admin", exp: Date.now() - 1 }),
+      JSON.stringify({ role: "admin", exp: Date.now() - 1, version: 17 }),
     ).toString("base64url");
     expect(await verifyAdminSessionToken(`${body}.${nodeSign(body)}`, SECRET)).toBe(
       false,
@@ -42,8 +42,17 @@ describe("session cookie crypto", () => {
 
   it("parses valid session bodies", () => {
     const body = Buffer.from(
-      JSON.stringify({ role: "admin", exp: Date.now() + 1000 }),
+      JSON.stringify({ role: "admin", exp: Date.now() + 1000, version: 17 }),
     ).toString("base64url");
     expect(parseSessionBody(body)?.role).toBe("admin");
+  });
+
+  it("rejects legacy payloads without a credential version", async () => {
+    const body = Buffer.from(
+      JSON.stringify({ role: "admin", exp: Date.now() + 60_000 }),
+    ).toString("base64url");
+
+    expect(parseSessionBody(body)).toBeNull();
+    expect(await verifyAdminSessionToken(`${body}.${nodeSign(body)}`, SECRET)).toBe(false);
   });
 });

@@ -1,6 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { cookies } from "next/headers";
-import { verifyAdminPassword as verifyPassword } from "@/lib/auth/password";
+import {
+  getAdminSessionVersion,
+  verifyAdminPassword as verifyPassword,
+} from "@/lib/auth/password";
 import {
   ADMIN_SESSION_COOKIE,
   ADMIN_SESSION_MAX_AGE_SECONDS,
@@ -31,12 +34,16 @@ function decodeSession(token: string, secret: string): AdminSessionPayload | nul
   return parseSessionBody(body);
 }
 
-export async function createAdminSession(): Promise<void> {
+export async function createAdminSession(version: number): Promise<void> {
+  if (!Number.isSafeInteger(version) || version <= 0) {
+    throw new Error("Cannot create an admin session without a valid credential version");
+  }
   const env = getEnv();
   const token = encodeSession(
     {
       role: "admin",
       exp: Date.now() + ADMIN_SESSION_MAX_AGE_SECONDS * 1000,
+      version,
     },
     env.SESSION_SECRET,
   );
@@ -66,7 +73,9 @@ export async function isAdminAuthenticated(): Promise<boolean> {
   const jar = await cookies();
   const token = jar.get(ADMIN_SESSION_COOKIE)?.value;
   if (!token) return false;
-  return decodeSession(token, env.SESSION_SECRET) !== null;
+  const payload = decodeSession(token, env.SESSION_SECRET);
+  if (!payload) return false;
+  return payload.version === getAdminSessionVersion();
 }
 
 export function verifyAdminPassword(password: string): boolean {

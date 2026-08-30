@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, request as playwrightRequest, test } from "@playwright/test";
 import { e2eAdminPassword } from "./test-env";
 
 test.describe("IsMe smoke", () => {
@@ -252,6 +252,7 @@ test.describe("IsMe smoke", () => {
     await page.goto("/admin/login");
     await page.locator('input[type="password"]').fill(e2eAdminPassword());
     await page.getByRole("button", { name: /登录后台|sudo/i }).click();
+    await expect(page).toHaveURL(/\/admin$/);
     await page.goto("/admin/setup");
 
     await expect(
@@ -480,6 +481,86 @@ test.describe("IsMe smoke", () => {
     const missing = await page.goto("/this-path-does-not-exist-xyz");
     expect(missing?.status()).toBe(404);
     await expect(page.getByText(/404/i)).toBeVisible();
+  });
+
+  test("changing the admin password revokes every previously issued session", async ({
+    browser,
+    page,
+  }) => {
+    const newPassword = "e2e rotated password with 2026 entropy";
+    await page.goto("/admin/login");
+    const baseURL = new URL(page.url()).origin;
+
+    const login = await page.request.post("/api/admin/login", {
+      data: { password: e2eAdminPassword() },
+    });
+    expect(login.status()).toBe(200);
+    const oldSession = (await page.context().cookies()).find(
+      (cookie) => cookie.name === "isme_admin_session",
+    );
+    expect(oldSession?.value).toBeTruthy();
+    const oldCookieHeader = `${oldSession!.name}=${oldSession!.value}`;
+    await page.goto("/admin");
+    await expect(page).toHaveURL(/\/admin$/);
+
+    const changed = await page.evaluate(
+      async (payload) => {
+        const response = await fetch("/api/admin/password", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        return { status: response.status, body: await response.text() };
+      },
+      {
+        currentPassword: e2eAdminPassword(),
+        newPassword,
+        confirmPassword: newPassword,
+      },
+    );
+    expect(changed.status, changed.body).toBe(200);
+    expect(
+      (await page.context().cookies()).some(
+        (cookie) => cookie.name === "isme_admin_session",
+      ),
+    ).toBe(false);
+
+    const oldApi = await playwrightRequest.newContext({
+      baseURL,
+      extraHTTPHeaders: { Cookie: oldCookieHeader },
+    });
+    const oldBrowser = await browser.newContext({
+      extraHTTPHeaders: { Cookie: oldCookieHeader },
+    });
+    try {
+      expect((await oldApi.get("/api/admin/readiness")).status()).toBe(401);
+      const oldPage = await oldBrowser.newPage();
+      await oldPage.goto(`${baseURL}/admin/profile`);
+      await expect(oldPage).toHaveURL(/\/admin\/login/);
+    } finally {
+      await oldApi.dispose();
+      await oldBrowser.close();
+    }
+
+    const loginFromBrowser = (password: string) =>
+      page.evaluate(async (candidate) => {
+        const response = await fetch("/api/admin/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: candidate }),
+        });
+        return response.status;
+      }, password);
+    expect(await loginFromBrowser(e2eAdminPassword())).toBe(401);
+    expect(await loginFromBrowser(newPassword)).toBe(200);
+    const newSession = (await page.context().cookies()).find(
+      (cookie) => cookie.name === "isme_admin_session",
+    );
+    expect(newSession?.value).toBeTruthy();
+    expect(newSession?.value).not.toBe(oldSession?.value);
+    expect(
+      await page.evaluate(() => fetch("/api/admin/readiness").then((res) => res.status)),
+    ).toBe(200);
   });
 
   test("health endpoint reports ok", async ({ request }) => {
