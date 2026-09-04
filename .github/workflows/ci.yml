@@ -26,35 +26,21 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Unit tests
-        run: npm test
-
-      - name: Dependency audit
-        run: npm audit --audit-level=high
-
-      # Match the important first-deploy path: compilation must never depend on
-      # render-time demo seeding or a pre-populated SQLite file.
-      - name: Build from an empty database
-        env:
-          ISME_DATABASE_PATH: /tmp/isme-ci-empty.db
-        run: npm run build
-
-      - name: Verify migrate & seed commands
+      # Keep the runner's bundled npm untouched. Install packageManager into an
+      # isolated directory, then make that exact binary authoritative.
+      - name: Enable repository npm
         run: |
-          npm run db:migrate
-          npm run db:seed
+          npm_spec="$(node -p "require('./package.json').packageManager")"
+          case "$npm_spec" in
+            npm@*) ;;
+            *) echo "Unsupported packageManager: $npm_spec" >&2; exit 1 ;;
+          esac
+          npm_toolchain="$RUNNER_TEMP/npm-toolchain"
+          npm install --prefix "$npm_toolchain" --no-save --ignore-scripts "$npm_spec"
+          echo "$npm_toolchain/node_modules/.bin" >> "$GITHUB_PATH"
 
-      - name: Install Playwright Chromium
-        run: npx playwright install --with-deps chromium
-
-      - name: End-to-end smoke
-        run: npm run test:e2e
+      - name: Required verification
+        run: bash scripts/verify-ci.sh
