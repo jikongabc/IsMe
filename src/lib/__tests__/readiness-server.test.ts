@@ -103,4 +103,41 @@ describe("loadReadinessInput credential projection", () => {
       sessionSecretReady: true,
     });
   });
+
+  it("projects the stored RichContent format for projects and posts", async () => {
+    mocks.getAdminProfile.mockResolvedValue(profile(""));
+    mocks.listAdminProjects.mockResolvedValue([
+      {
+        id: "project_html",
+        slug: "html-project",
+        description: '<a href="/project">Project</a>',
+        descriptionEn: "",
+        contentFormat: "html",
+        metrics: [],
+        decisions: [],
+        gallery: [],
+      },
+    ]);
+    mocks.listAdminPosts.mockResolvedValue([
+      {
+        id: "post_markdown",
+        slug: "markdown-post",
+        contentMarkdown: "[Post](/post)",
+        contentEn: "",
+        contentFormat: "markdown",
+        tags: [],
+      },
+    ]);
+
+    const input = await loadReadinessInput();
+
+    expect(input.projects[0]).toMatchObject({
+      id: "project_html",
+      contentFormat: "html",
+    });
+    expect(input.posts[0]).toMatchObject({
+      id: "post_markdown",
+      contentFormat: "markdown",
+    });
+  });
 });

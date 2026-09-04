@@ -1,4 +1,5 @@
 import { findPlaceholderMatches } from "./placeholders";
+import { extractRichContentHrefs } from "./rich-content-links";
 import type {
   ReadinessCategory,
   ReadinessCounts,
@@ -1365,7 +1366,10 @@ export function collectReadinessLinks(input: ReadinessInput): ReadinessLinkTarge
     let normalized = value;
     try {
       const url = value.startsWith("/") && baseUrl ? new URL(value, baseUrl) : new URL(value);
-      if (url.protocol === "http:" || url.protocol === "https:") normalized = url.toString();
+      if (url.protocol === "http:" || url.protocol === "https:") {
+        url.hash = "";
+        normalized = url.toString();
+      }
     } catch {
       // Preserve malformed legacy values so the safe network layer can return
       // an explicit blocked/skipped result instead of silently missing them.
@@ -1373,6 +1377,23 @@ export function collectReadinessLinks(input: ReadinessInput): ReadinessLinkTarge
     if (seen.has(normalized)) return;
     seen.add(normalized);
     targets.push({ url: normalized, label, source });
+  };
+
+  const addRichContentHref = (raw: string, label: string, source: string) => {
+    const value = raw.trim();
+    if (!value) return;
+
+    try {
+      const url = baseUrl ? new URL(value, baseUrl) : new URL(value);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return;
+      // Fragments never affect the HTTP resource and must not enter reports or
+      // consume duplicate audit slots.
+      url.hash = "";
+      add(url.toString(), label, source);
+    } catch {
+      // RichContent hrefs are user-authored body data. Unlike legacy dedicated
+      // URL fields, malformed or unresolvable relative hrefs fail closed.
+    }
   };
 
   add(input.env.siteUrl, "站点公开地址", "deployment:site-url");
@@ -1418,10 +1439,40 @@ export function collectReadinessLinks(input: ReadinessInput): ReadinessLinkTarge
       project.gallery.forEach((gallery, index) =>
         add(gallery.src, `${project.name} 图片 ${index + 1}`, `project:${project.slug}:gallery`),
       );
+      (
+        [
+          ["description", project.description],
+          ["descriptionEn", project.descriptionEn],
+        ] as const
+      ).forEach(([field, content]) =>
+        extractRichContentHrefs(content, project.contentFormat).forEach((href) =>
+          addRichContentHref(
+            href,
+            `${project.name || project.slug} 正文链接`,
+            `project:${project.slug}:${field}`,
+          ),
+        ),
+      );
     });
   input.posts
     .filter((post) => post.status === "published")
-    .forEach((post) => add(post.coverUrl, `${post.title} 封面`, `post:${post.slug}:cover`));
+    .forEach((post) => {
+      add(post.coverUrl, `${post.title} 封面`, `post:${post.slug}:cover`);
+      (
+        [
+          ["contentMarkdown", post.contentMarkdown],
+          ["contentEn", post.contentEn],
+        ] as const
+      ).forEach(([field, content]) =>
+        extractRichContentHrefs(content, post.contentFormat).forEach((href) =>
+          addRichContentHref(
+            href,
+            `${post.title || post.slug} 正文链接`,
+            `post:${post.slug}:${field}`,
+          ),
+        ),
+      );
+    });
 
   return targets;
 }

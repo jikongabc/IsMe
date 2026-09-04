@@ -86,9 +86,10 @@ describe("admin readiness route", () => {
       unverifiedCount: 0,
     });
     mocks.applyKnowledgeHealth.mockImplementation((report) => report);
-    mocks.applyLinkChecks.mockImplementation((report, checks) => ({
+    mocks.applyLinkChecks.mockImplementation((report, checks, totalTargetCount) => ({
       ...report,
       linkChecks: checks,
+      linkTargetCount: totalTargetCount,
     }));
   });
 
@@ -140,6 +141,32 @@ describe("admin readiness route", () => {
       expect.objectContaining({
         action: "readiness.links.check",
         detail: { total: 1, targets: 1, ok: 1, failed: 0, blocked: 0, skipped: 0 },
+      }),
+    );
+  });
+
+  it("passes the full discovered count to the report when the audit is bounded", async () => {
+    const targets = Array.from({ length: 42 }, (_, index) => ({
+      url: `https://portfolio.example/${index}`,
+      label: `Target ${index}`,
+      source: `body:${index}`,
+    }));
+    mocks.collectReadinessLinks.mockReturnValueOnce(targets);
+    mocks.auditReadinessLinks.mockResolvedValueOnce(
+      targets.slice(0, 40).map((target) => ({ ...target, status: "ok" })),
+    );
+
+    await POST(new Request("http://localhost/api/admin/readiness", { method: "POST" }));
+
+    expect(mocks.applyLinkChecks).toHaveBeenCalledWith(
+      baseReport,
+      expect.any(Array),
+      42,
+    );
+    expect(mocks.tryAuditRequest).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        detail: expect.objectContaining({ total: 40, targets: 42 }),
       }),
     );
   });

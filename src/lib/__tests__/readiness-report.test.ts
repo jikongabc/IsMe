@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { findPlaceholderMatches } from "@/lib/readiness/placeholders";
+import { extractRichContentHrefs } from "@/lib/readiness/rich-content-links";
 import {
   applyKnowledgeHealth,
   applyLinkChecks,
@@ -78,6 +79,7 @@ function cleanInput(): ReadinessInput {
           "项目从研究团队无法复盘错误回答的问题出发。我将检索、生成、引用校验和人工反馈拆成明确阶段，并保存每一步证据。为了让上线运维保持简单，首版选择单机事务存储，同时通过边界清晰的数据访问层保留未来迁移空间。最终交付包括管理后台、公开问答与逐请求质量追踪。",
         descriptionEn:
           "The project makes retrieval, generation, citation validation, and feedback explicit so every incorrect answer can be diagnosed. It ships with an admin console, public Q&A, and request-level quality traces.",
+        contentFormat: "markdown",
         coverUrl: "/uploads/signal-cover.png",
         repositoryUrl: "https://github.com/lin-zhiyuan/signal-desk",
         demoUrl: "https://signal.portfolio.dev",
@@ -128,6 +130,7 @@ function cleanInput(): ReadinessInput {
         excerptEn: "Evaluate citation formatting separately from evidence support.",
         contentMarkdown: "# 引用校验\n\n先检查文档存在，再验证引用片段是否支持回答中的具体主张。",
         contentEn: "# Citation validation\n\nCheck document existence and claim support separately.",
+        contentFormat: "markdown",
         coverUrl: "",
         category: "Engineering",
         tags: ["RAG", "Evaluation"],
@@ -590,6 +593,117 @@ describe("readiness scoring and link composition", () => {
     expect(targets.some((target) => target.url.endsWith("/lin-zhiyuan/draft"))).toBe(false);
     expect(targets.some((target) => target.url.includes("user:secret@links.portfolio.dev"))).toBe(true);
     expect(targets.some((target) => target.url === "not a url")).toBe(true);
+  });
+
+  it("follows RichContent Markdown and HTML modes without guessing", () => {
+    expect(
+      extractRichContentHrefs(
+        '[Markdown](/docs) <a href="https://docs.portfolio.dev/raw">Raw</a> ' +
+          'https://plain.portfolio.dev ![Image](https://images.portfolio.dev/shot.png)',
+        "markdown",
+      ),
+    ).toEqual(["/docs", "https://docs.portfolio.dev/raw"]);
+
+    expect(
+      extractRichContentHrefs(
+        '[Plain text](https://not-clickable.portfolio.dev) ' +
+          '<a href="/html-docs">HTML</a><img src="https://images.portfolio.dev/shot.png">',
+        "html",
+      ),
+    ).toEqual(["/html-docs"]);
+
+    expect(extractRichContentHrefs("[Unknown](https://unknown.portfolio.dev)", "rich-text"))
+      .toEqual([]);
+    expect(extractRichContentHrefs("[Missing](https://missing.portfolio.dev)", undefined))
+      .toEqual([]);
+  });
+
+  it("collects published body anchors with field sources, relative resolution, and deduplication", () => {
+    const input = cleanInput();
+    input.projects[0].description = [
+      "[Project docs](/guides/project#overview)",
+      '<a href="https://shared.portfolio.dev/reference#project">Shared</a>',
+      "[Email](mailto:owner@portfolio.dev)",
+      "![Screenshot](https://images.portfolio.dev/project.png)",
+      "https://plain.portfolio.dev/project",
+    ].join("\n\n");
+    input.projects[0].descriptionEn = "";
+    input.posts[0].contentMarkdown = [
+      "[Article docs](guides/article?preview=public#intro)",
+      "[Shared again](https://shared.portfolio.dev/reference#article)",
+    ].join("\n\n");
+    input.posts[0].contentEn = "";
+
+    const targets = collectReadinessLinks(input);
+
+    expect(targets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          url: "https://portfolio.dev/guides/project",
+          source: "project:signal-desk:description",
+        }),
+        expect.objectContaining({
+          url: "https://shared.portfolio.dev/reference",
+          source: "project:signal-desk:description",
+        }),
+        expect.objectContaining({
+          url: "https://portfolio.dev/guides/article?preview=public",
+          source: "post:validate-citations:contentMarkdown",
+        }),
+      ]),
+    );
+    expect(
+      targets.filter((target) => target.url === "https://shared.portfolio.dev/reference"),
+    ).toHaveLength(1);
+    expect(targets.some((target) => target.url.startsWith("mailto:"))).toBe(false);
+    expect(targets.some((target) => target.url.includes("images.portfolio.dev"))).toBe(false);
+    expect(targets.some((target) => target.url.includes("plain.portfolio.dev"))).toBe(false);
+    expect(JSON.stringify(targets)).not.toContain("#overview");
+    expect(JSON.stringify(targets)).not.toContain("#intro");
+  });
+
+  it("keeps HTML-mode Markdown text and unpublished body links out of the audit", () => {
+    const input = cleanInput();
+    input.projects[0].contentFormat = "html";
+    input.projects[0].description =
+      '[Not clickable](https://plain-in-html.portfolio.dev) <a href="/allowed-html">Allowed</a>';
+    input.projects[0].descriptionEn = "";
+    input.posts[0].contentFormat = "html";
+    input.posts[0].contentMarkdown =
+      '[Still text](https://post-plain-in-html.portfolio.dev) <a href="/post-html">Post</a>';
+    input.posts[0].contentEn = "";
+    input.projects.push({
+      ...input.projects[0],
+      id: "project_archived",
+      slug: "archived-project",
+      status: "archived",
+      description: '<a href="https://archived.portfolio.dev">Archived</a>',
+    });
+    input.posts.push({
+      ...input.posts[0],
+      id: "post_draft",
+      slug: "draft-post",
+      status: "draft",
+      contentMarkdown: '<a href="https://draft.portfolio.dev">Draft</a>',
+    });
+
+    const targets = collectReadinessLinks(input);
+
+    expect(targets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          url: "https://portfolio.dev/allowed-html",
+          source: "project:signal-desk:description",
+        }),
+        expect.objectContaining({
+          url: "https://portfolio.dev/post-html",
+          source: "post:validate-citations:contentMarkdown",
+        }),
+      ]),
+    );
+    expect(JSON.stringify(targets)).not.toContain("plain-in-html");
+    expect(JSON.stringify(targets)).not.toContain("archived.portfolio.dev");
+    expect(JSON.stringify(targets)).not.toContain("draft.portfolio.dev");
   });
 
   it("turns failed or SSRF-blocked checks into a release blocker and recomputes totals", () => {

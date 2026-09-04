@@ -224,7 +224,7 @@ describe("auditReadinessLinks", () => {
     const transport = vi.fn(async () => ({ statusCode: 200 }));
     const results = await auditReadinessLinks(
       [
-        target("https://admin:secret@example.com/path?token=hidden"),
+        target("https://admin:secret@example.com/path?token=hidden#anchor"),
         target("https://example.com:8443/path"),
       ],
       { lookup: publicLookup, transport },
@@ -233,6 +233,7 @@ describe("auditReadinessLinks", () => {
     expect(results.map((result) => result.status)).toEqual(["blocked", "blocked"]);
     expect(JSON.stringify(results)).not.toContain("secret");
     expect(JSON.stringify(results)).not.toContain("hidden");
+    expect(JSON.stringify(results)).not.toContain("anchor");
     expect(transport).not.toHaveBeenCalled();
   });
 
