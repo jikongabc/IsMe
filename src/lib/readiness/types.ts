@@ -136,6 +136,7 @@ export type ReadinessProject = {
   summaryEn: string;
   description: string;
   descriptionEn: string;
+  contentFormat: string;
   coverUrl: string;
   repositoryUrl: string;
   demoUrl: string;
@@ -161,6 +162,7 @@ export type ReadinessPost = {
   excerptEn: string;
   contentMarkdown: string;
   contentEn: string;
+  contentFormat: string;
   coverUrl: string;
   category: string;
   tags: string[];
