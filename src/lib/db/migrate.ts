@@ -234,6 +234,154 @@ CREATE TABLE IF NOT EXISTS rate_limit_buckets (
 );
 `;
 
+const ADDITIVE_MIGRATIONS = [
+  ["site_profiles", "site_name", "TEXT NOT NULL DEFAULT 'IsMe'"],
+  ["site_profiles", "display_name", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "english_name", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "role", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "headline", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "introduction", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "avatar_url", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "location", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "public_email", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "availability", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "theme", "TEXT NOT NULL DEFAULT 'terminal'"],
+  ["site_profiles", "default_locale", "TEXT NOT NULL DEFAULT 'zh'"],
+  ["site_profiles", "theme_config", "TEXT NOT NULL DEFAULT '{}'"],
+  ["site_profiles", "role_en", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "headline_en", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "introduction_en", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "availability_en", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "admin_password_hash", "TEXT NOT NULL DEFAULT ''"],
+  ["site_profiles", "admin_session_version", "INTEGER NOT NULL DEFAULT 0"],
+  ["experiences", "organization_en", "TEXT NOT NULL DEFAULT ''"],
+  ["experiences", "role_en", "TEXT NOT NULL DEFAULT ''"],
+  ["experiences", "description_en", "TEXT NOT NULL DEFAULT ''"],
+  ["projects", "name_en", "TEXT NOT NULL DEFAULT ''"],
+  ["projects", "summary_en", "TEXT NOT NULL DEFAULT ''"],
+  ["projects", "description_en", "TEXT NOT NULL DEFAULT ''"],
+  ["projects", "content_format", "TEXT NOT NULL DEFAULT 'markdown'"],
+  ["projects", "role", "TEXT NOT NULL DEFAULT ''"],
+  ["projects", "role_en", "TEXT NOT NULL DEFAULT ''"],
+  ["projects", "team_size", "INTEGER NOT NULL DEFAULT 0"],
+  ["projects", "duration", "TEXT NOT NULL DEFAULT ''"],
+  ["projects", "duration_en", "TEXT NOT NULL DEFAULT ''"],
+  ["projects", "metrics", "TEXT NOT NULL DEFAULT '[]'"],
+  ["projects", "decisions", "TEXT NOT NULL DEFAULT '[]'"],
+  ["projects", "gallery", "TEXT NOT NULL DEFAULT '[]'"],
+  ["blog_posts", "tags", "TEXT NOT NULL DEFAULT '[]'"],
+  ["blog_posts", "title_en", "TEXT NOT NULL DEFAULT ''"],
+  ["blog_posts", "excerpt_en", "TEXT NOT NULL DEFAULT ''"],
+  ["blog_posts", "content_en", "TEXT NOT NULL DEFAULT ''"],
+  ["blog_posts", "content_format", "TEXT NOT NULL DEFAULT 'markdown'"],
+  ["focus_areas", "title_en", "TEXT NOT NULL DEFAULT ''"],
+  ["focus_areas", "description_en", "TEXT NOT NULL DEFAULT ''"],
+  ["knowledge_base_modules", "name_en", "TEXT NOT NULL DEFAULT ''"],
+  ["knowledge_base_modules", "description_en", "TEXT NOT NULL DEFAULT ''"],
+  ["knowledge_base_modules", "welcome_message_en", "TEXT NOT NULL DEFAULT ''"],
+  ["knowledge_base_modules", "suggested_questions_en", "TEXT NOT NULL DEFAULT '[]'"],
+  ["knowledge_base_modules", "last_content_sync_at", "TEXT NOT NULL DEFAULT ''"],
+  ["knowledge_base_modules", "last_content_sync_summary", "TEXT NOT NULL DEFAULT ''"],
+  ["page_views", "device", "TEXT NOT NULL DEFAULT ''"],
+  ["page_views", "country", "TEXT NOT NULL DEFAULT ''"],
+] as const;
+
+type SchemaColumn = {
+  defaultValue: string | null;
+  name: string;
+  notNull: number;
+  primaryKey: number;
+  type: string;
+};
+
+function tableColumns(sqlite: Database.Database, table: string): SchemaColumn[] {
+  return sqlite
+    .prepare(
+      `SELECT
+         name,
+         type,
+         "notnull" AS "notNull",
+         dflt_value AS "defaultValue",
+         pk AS "primaryKey"
+       FROM pragma_table_info(?)`,
+    )
+    .all(table) as SchemaColumn[];
+}
+
+function assertSupportedLegacySchema(sqlite: Database.Database): void {
+  const existingTables = new Set(
+    (
+      sqlite
+        .prepare(
+          `SELECT name
+           FROM sqlite_master
+           WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
+        )
+        .all() as Array<{ name: string }>
+    ).map((table) => table.name),
+  );
+  if (existingTables.size === 0) return;
+
+  const reference = new Database(":memory:");
+  try {
+    reference.exec(DDL);
+    const expectedTables = reference
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name`,
+      )
+      .all() as Array<{ name: string }>;
+
+    for (const { name: table } of expectedTables) {
+      if (!existingTables.has(table)) continue;
+
+      const actualByName = new Map(
+        tableColumns(sqlite, table).map((column) => [column.name, column]),
+      );
+      const additiveColumns = new Set<string>(
+        ADDITIVE_MIGRATIONS.filter(([candidate]) => candidate === table).map(
+          ([, column]) => column,
+        ),
+      );
+      const missing: string[] = [];
+      const incompatible: string[] = [];
+
+      for (const expected of tableColumns(reference, table)) {
+        const actual = actualByName.get(expected.name);
+        if (!actual) {
+          if (!additiveColumns.has(expected.name)) missing.push(expected.name);
+          continue;
+        }
+        if (
+          !additiveColumns.has(expected.name) &&
+          (actual.type.toUpperCase() !== expected.type.toUpperCase() ||
+            actual.notNull !== expected.notNull ||
+            actual.defaultValue !== expected.defaultValue ||
+            actual.primaryKey !== expected.primaryKey)
+        ) {
+          incompatible.push(expected.name);
+        }
+      }
+
+      if (missing.length > 0 || incompatible.length > 0) {
+        const reasons = [
+          missing.length > 0 ? `missing required columns: ${missing.join(", ")}` : "",
+          incompatible.length > 0
+            ? `incompatible column definitions: ${incompatible.join(", ")}`
+            : "",
+        ].filter(Boolean);
+        throw new Error(
+          `Unsupported legacy schema for table "${table}": ${reasons.join("; ")}`,
+        );
+      }
+    }
+  } finally {
+    reference.close();
+  }
+}
+
 function ensureColumn(
   sqlite: Database.Database,
   table: string,
@@ -246,17 +394,12 @@ function ensureColumn(
 }
 
 export function ensureSchema(sqlite: Database.Database): void {
+  assertSupportedLegacySchema(sqlite);
   const migrate = sqlite.transaction(() => {
     sqlite.exec(DDL);
-    ensureColumn(sqlite, "site_profiles", "theme", "TEXT NOT NULL DEFAULT 'terminal'");
-    ensureColumn(sqlite, "site_profiles", "default_locale", "TEXT NOT NULL DEFAULT 'zh'");
-    ensureColumn(sqlite, "site_profiles", "theme_config", "TEXT NOT NULL DEFAULT '{}'");
-    ensureColumn(sqlite, "site_profiles", "role_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "site_profiles", "headline_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "site_profiles", "introduction_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "site_profiles", "availability_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "site_profiles", "admin_password_hash", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "site_profiles", "admin_session_version", "INTEGER NOT NULL DEFAULT 0");
+    for (const [table, column, definition] of ADDITIVE_MIGRATIONS) {
+      ensureColumn(sqlite, table, column, definition);
+    }
     // A cryptographically random positive starting point rejects all
     // pre-version cookies without giving every upgraded installation the same
     // credential generation. The WHERE clause keeps reruns idempotent.
@@ -274,56 +417,6 @@ export function ensureSchema(sqlite: Database.Database): void {
         profile.id,
       );
     }
-    ensureColumn(sqlite, "experiences", "organization_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "experiences", "role_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "experiences", "description_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "projects", "name_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "projects", "summary_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "projects", "description_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "projects", "content_format", "TEXT NOT NULL DEFAULT 'markdown'");
-    ensureColumn(sqlite, "projects", "role", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "projects", "role_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "projects", "team_size", "INTEGER NOT NULL DEFAULT 0");
-    ensureColumn(sqlite, "projects", "duration", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "projects", "duration_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "projects", "metrics", "TEXT NOT NULL DEFAULT '[]'");
-    ensureColumn(sqlite, "projects", "decisions", "TEXT NOT NULL DEFAULT '[]'");
-    ensureColumn(sqlite, "projects", "gallery", "TEXT NOT NULL DEFAULT '[]'");
-    ensureColumn(sqlite, "blog_posts", "tags", "TEXT NOT NULL DEFAULT '[]'");
-    ensureColumn(sqlite, "blog_posts", "title_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "blog_posts", "excerpt_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "blog_posts", "content_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "blog_posts", "content_format", "TEXT NOT NULL DEFAULT 'markdown'");
-    ensureColumn(sqlite, "focus_areas", "title_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "focus_areas", "description_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "knowledge_base_modules", "name_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "knowledge_base_modules", "description_en", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(
-      sqlite,
-      "knowledge_base_modules",
-      "welcome_message_en",
-      "TEXT NOT NULL DEFAULT ''",
-    );
-    ensureColumn(
-      sqlite,
-      "knowledge_base_modules",
-      "suggested_questions_en",
-      "TEXT NOT NULL DEFAULT '[]'",
-    );
-    ensureColumn(
-      sqlite,
-      "knowledge_base_modules",
-      "last_content_sync_at",
-      "TEXT NOT NULL DEFAULT ''",
-    );
-    ensureColumn(
-      sqlite,
-      "knowledge_base_modules",
-      "last_content_sync_summary",
-      "TEXT NOT NULL DEFAULT ''",
-    );
-    ensureColumn(sqlite, "page_views", "device", "TEXT NOT NULL DEFAULT ''");
-    ensureColumn(sqlite, "page_views", "country", "TEXT NOT NULL DEFAULT ''");
     sqlite.exec(`
       UPDATE projects
       SET
