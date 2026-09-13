@@ -32,6 +32,7 @@ export async function POST(request: Request) {
         "Content-Type": "application/octet-stream",
         "Content-Disposition": `attachment; filename="${filename}"`,
         "Content-Length": String(bytes.length),
+        "Cache-Control": "no-store",
       },
     });
   } catch (error) {
@@ -40,10 +41,7 @@ export async function POST(request: Request) {
       ok: false,
       detail: { error: error instanceof Error ? error.message : "failed" },
     });
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "backup failed" },
-      { status: 500 },
-    );
+    return NextResponse.json({ error: "Backup failed" }, { status: 500 });
   } finally {
     if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
   }
