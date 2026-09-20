@@ -15,10 +15,10 @@ export async function GET() {
   try {
     getDb().select({ id: siteProfiles.id }).from(siteProfiles).limit(1).all();
     checks.database = { ok: true };
-  } catch (error) {
+  } catch {
     checks.database = {
       ok: false,
-      detail: error instanceof Error ? error.message : "db error",
+      detail: "database unavailable",
     };
   }
 
