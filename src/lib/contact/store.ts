@@ -1,4 +1,4 @@
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import { getDb } from "@/lib/db";
 import { contactMessages, type ContactMessage } from "@/lib/db/schema";
@@ -32,7 +32,15 @@ export function listAdminContacts(limit = 200): ContactMessage[] {
   return getDb()
     .select()
     .from(contactMessages)
-    .orderBy(desc(contactMessages.createdAt))
+    .orderBy(
+      sql`CASE ${contactMessages.status}
+        WHEN 'unread' THEN 0
+        WHEN 'read' THEN 1
+        WHEN 'archived' THEN 2
+        ELSE 3
+      END`,
+      desc(contactMessages.createdAt),
+    )
     .limit(limit)
     .all();
 }
