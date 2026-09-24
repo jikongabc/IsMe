@@ -9,9 +9,12 @@ import {
 } from "@/lib/cogdoc/request";
 import { getEnabledKbBySlug } from "@/lib/content/queries";
 import { isCogDocConfigured } from "@/lib/env";
+import { parseJsonBody } from "@/lib/http/parse-json";
 import { takeToken } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
+
+const FEEDBACK_BODY_MAX_BYTES = 131_072;
 
 const feedbackSchema = z.object({
   moduleSlug: z.string().min(1).max(120),
@@ -33,14 +36,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Too many requests", code: "RATE_LIMITED" }, { status: 429 });
   }
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
+  const body = await parseJsonBody(request, { maxBytes: FEEDBACK_BODY_MAX_BYTES });
+  if (!body.ok) {
+    if (body.response.status === 413) return body.response;
     return NextResponse.json({ error: "Invalid JSON", code: "BAD_REQUEST" }, { status: 400 });
   }
 
-  const parsed = feedbackSchema.safeParse(body);
+  const parsed = feedbackSchema.safeParse(body.data);
   if (!parsed.success) {
     return NextResponse.json(
       { error: "Invalid feedback payload", code: "BAD_REQUEST" },
