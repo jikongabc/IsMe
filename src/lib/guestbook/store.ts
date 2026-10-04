@@ -1,4 +1,4 @@
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import { getDb } from "@/lib/db";
 import { guestbookMessages, type GuestbookMessage } from "@/lib/db/schema";
@@ -18,21 +18,18 @@ export function listApprovedGuestbook(limit = 100): GuestbookMessage[] {
 }
 
 export function listAdminGuestbook(limit = 200): GuestbookMessage[] {
-  const rows = getDb()
+  const statusPriority = sql<number>`CASE ${guestbookMessages.status}
+    WHEN 'pending' THEN 0
+    WHEN 'approved' THEN 1
+    ELSE 2
+  END`;
+
+  return getDb()
     .select()
     .from(guestbookMessages)
-    .orderBy(desc(guestbookMessages.createdAt))
+    .orderBy(statusPriority, desc(guestbookMessages.createdAt))
     .limit(limit)
     .all();
-
-  const rank = (status: string) =>
-    status === "pending" ? 0 : status === "approved" ? 1 : 2;
-
-  return [...rows].sort((a, b) => {
-    const byStatus = rank(a.status) - rank(b.status);
-    if (byStatus !== 0) return byStatus;
-    return b.createdAt.localeCompare(a.createdAt);
-  });
 }
 
 export function countGuestbookByStatus(): {
