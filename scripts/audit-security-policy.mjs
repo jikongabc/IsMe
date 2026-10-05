@@ -7,15 +7,15 @@ import { tmpdir } from "node:os";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const POLICY_VERSION = "isme-security-policy-v5-bounded-decoding";
+const POLICY_VERSION = "isme-security-policy-v6-mode-only";
 const ALLOWED_ADVISORY = "GHSA-vfj7-8cjw-p6xm";
 const EXPIRES_AT = "2026-10-19T00:00:00+08:00";
 const EXPIRES_AT_MS = Date.parse(EXPIRES_AT);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const EXPECTED_HIGH_CRITICAL = ["@next/eslint-plugin-next", "braces", "eslint-config-next", "fast-glob", "micromatch"];
-const EXPECTED_FULL_COUNTS = { info: 0, low: 1, moderate: 6, high: 5, critical: 0, total: 12 };
+const EXPECTED_FULL_COUNTS = { info: 0, low: 0, moderate: 6, high: 5, critical: 0, total: 11 };
 const EXPECTED_FULL_ADVISORIES = [
-  "GHSA-67mh-4wv8-2f99", "GHSA-82fw-gwwq-j7x9", "GHSA-p98j-92pf-mc4p", "GHSA-vfj7-8cjw-p6xm",
+  "GHSA-67mh-4wv8-2f99", "GHSA-82fw-gwwq-j7x9", "GHSA-vfj7-8cjw-p6xm",
 ];
 const EXPECTED_FULL_VULNERABILITIES = [
   { name: "@esbuild-kit/core-utils", severity: "moderate", advisories: ["GHSA-67mh-4wv8-2f99"], nodes: ["node_modules/@esbuild-kit/core-utils"] },
@@ -23,7 +23,6 @@ const EXPECTED_FULL_VULNERABILITIES = [
   { name: "@next/eslint-plugin-next", severity: "high", advisories: [ALLOWED_ADVISORY], nodes: ["node_modules/@next/eslint-plugin-next"] },
   { name: "@vitest/mocker", severity: "moderate", advisories: ["GHSA-82fw-gwwq-j7x9"], nodes: ["node_modules/vitest/node_modules/@vitest/mocker"] },
   { name: "braces", severity: "high", advisories: [ALLOWED_ADVISORY], nodes: ["node_modules/braces"] },
-  { name: "dompurify", severity: "low", advisories: ["GHSA-p98j-92pf-mc4p"], nodes: ["node_modules/dompurify"] },
   { name: "drizzle-kit", severity: "moderate", advisories: ["GHSA-67mh-4wv8-2f99"], nodes: ["node_modules/drizzle-kit"] },
   { name: "esbuild", severity: "moderate", advisories: ["GHSA-67mh-4wv8-2f99"], nodes: ["node_modules/@esbuild-kit/core-utils/node_modules/esbuild"] },
   { name: "eslint-config-next", severity: "high", advisories: [ALLOWED_ADVISORY], nodes: ["node_modules/eslint-config-next"] },
@@ -40,13 +39,21 @@ const OPTIONAL_PACKAGES = {
     path: "node_modules/@emnapi/runtime", version: "1.11.3",
     resolved: "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.11.3.tgz",
     integrity: "sha512-Xz4Tpyki7XyrpbUK1jR1AhdAdaXyhhY4lZ3neLodmhpuWfy2PAQN5B46sAiU4liOXGLkHypn/qU+jvfWSCYYLA==",
-    contentHash: "c81ef9794ff7f66ce8a263a9662caa2f114e9bea703cee4e45c603cbb45e179f", fileCount: 17,
+    semanticManifestHash: "f62d16c92463bdfd4e52c9ced0332255cd7c79ac991b936a72c870a2ff60a085",
+    rawManifestHashByUmask: {
+      "0002": "ef50ac3aa3dd410b42f38b44058db5a38acb26c45b8193b1546369840fffc32d",
+      "0022": "db5fb294bbfdbac3042c7289f474d0bb1110054340a03b41d6b7f3ac65f0fe3b",
+    }, fileCount: 17,
   },
   "@img/sharp-wasm32": {
     path: "node_modules/@img/sharp-wasm32", version: "0.35.5",
     resolved: "https://registry.npmjs.org/@img/sharp-wasm32/-/sharp-wasm32-0.35.5.tgz",
     integrity: "sha512-Ptsga1su4tQx+LLF1ECS9U6nz5kmrXKo6XVbtR48Ke3ZRxxgaWBu7IDtEe1quo8hiupwm6WFqxVlXaSf7IINGQ==",
-    contentHash: "0c5a32acc7b0bea64c297fc9c31cf63bcf52c20ee765ed5b330f96a8a55e3618", fileCount: 7,
+    semanticManifestHash: "2b2f5193ad97638aacfba7a8fe9f73e57df310e28768365fbc1fdedeac685e6b",
+    rawManifestHashByUmask: {
+      "0002": "1d5b06e61e4f1a8191c119daf8bb1c6bc0b1e7be8f6197453239b968372cdc3b",
+      "0022": "19c8a228816b4c6ec46c938b2ebd667714a11fcc8322c27ee81638474dfe563b",
+    }, fileCount: 7,
   },
 };
 const EXPECTED_EXTRANEOUS = Object.entries(OPTIONAL_PACKAGES)
@@ -211,8 +218,9 @@ async function packageDiagnosticManifest(packageName, root) {
       const stats = await lstat(absolutePath);
       if (stats.isDirectory()) { await walk(absolutePath, parts); continue; }
       if (stats.isFile()) {
-        manifest.push({ package: packageName, path: packagePath, type: "regular", rawMode: fourDigitMode(stats.mode),
-          normalizedMode: normalizedMode("regular", stats.mode), sha256: sha256(await readFile(absolutePath)) });
+        manifest.push({ package: packageName, path: packagePath, type: "regular", size: stats.size,
+          rawMode: fourDigitMode(stats.mode), normalizedMode: normalizedMode("regular", stats.mode),
+          sha256: sha256(await readFile(absolutePath)) });
         continue;
       }
       if (stats.isSymbolicLink()) {
@@ -221,8 +229,9 @@ async function packageDiagnosticManifest(packageName, root) {
         catch { target = null; }
         const safeTarget = safeSymlinkTarget(root, packagePath, target);
         if (!safeTarget.safe) errors.push({ package: packageName, code: "DIAGNOSTIC_SYMLINK_TARGET_UNSAFE" });
-        manifest.push({ package: packageName, path: packagePath, type: "symlink", rawMode: fourDigitMode(stats.mode),
-          normalizedMode: normalizedMode("symlink", stats.mode), symlinkTarget: safeTarget.value });
+        manifest.push({ package: packageName, path: packagePath, type: "symlink", size: stats.size,
+          rawMode: fourDigitMode(stats.mode), normalizedMode: normalizedMode("symlink", stats.mode),
+          symlinkTarget: safeTarget.value });
         continue;
       }
       errors.push({ package: packageName, code: "DIAGNOSTIC_TYPE_UNSUPPORTED" });
@@ -344,21 +353,17 @@ async function buildContentHashDiagnostic(environment, configReader = readSafeNp
       arch: environment.arch, libc: environment.libc, umask: fourDigitMode(process.umask()) },
     npmConfig, manifest, errors };
 }
-async function packageContentHash(root) {
-  const entries = [];
-  async function walk(directory) {
-    const children = (await readdir(directory, { withFileTypes: true })).sort((a, b) => utf8Compare(a.name, b.name));
-    for (const child of children) {
-      if (child.name === "node_modules" && child.isDirectory()) continue;
-      const path = resolve(directory, child.name), rel = relative(root, path).split(sep).join("/");
-      const stats = await lstat(path), mode = (stats.mode & 0o777777).toString(8);
-      if (stats.isDirectory()) await walk(path);
-      else if (stats.isSymbolicLink()) entries.push({ mode, path: rel, sha256: sha256(Buffer.from(await readlink(path), "utf8")), type: "symlink" });
-      else if (stats.isFile()) entries.push({ mode, path: rel, sha256: sha256(await readFile(path)), type: "file" });
-    }
-  }
-  await walk(root); entries.sort((a, b) => utf8Compare(a.path, b.path));
-  return { algorithm: "canonical-json-sha256-v1", fileCount: entries.length, sha256: sha256(canonical(entries)) };
+function contentManifestHashes(entries) {
+  const semanticEntries = entries.map(({ rawMode: _rawMode, ...entry }) => entry);
+  return { semanticSha256: sha256(canonical(semanticEntries)), rawSha256: sha256(canonical(entries)) };
+}
+async function packageContentHash(packageName, root) {
+  const result = await packageDiagnosticManifest(packageName, root);
+  if (result.errors.length) throw diagnosticError(result.errors[0].code);
+  const entries = result.manifest.map(({ package: _package, ...entry }) => entry);
+  return { algorithm: "canonical-json-sha256-v1", fileCount: entries.length,
+    symlinkCount: entries.filter(({ type }) => type === "symlink").length,
+    umask: fourDigitMode(process.umask()), ...contentManifestHashes(entries) };
 }
 async function scanInstalledPackages() {
   const packages = [], seen = new Set();
@@ -490,8 +495,11 @@ function decideOptional(input) {
       JSON.stringify(input.lock.sharpWebcontainers?.cpu) !== JSON.stringify(["wasm32"]) ||
       input.lock.sharpFreebsd?.dependencies?.["@img/sharp-wasm32"] !== "0.35.5" || input.lock.sharpFreebsd?.optional !== true)
     return { accepted: false, code: "OPTIONAL_TREE_LOCK_GRAPH_MISMATCH" };
-  for (const [name, expected] of Object.entries(OPTIONAL_PACKAGES)) if (input.content[name]?.sha256 !== expected.contentHash || input.content[name]?.fileCount !== expected.fileCount)
-    return { accepted: false, code: "OPTIONAL_TREE_CONTENT_HASH_MISMATCH" };
+  for (const [name, expected] of Object.entries(OPTIONAL_PACKAGES)) { const content = input.content[name];
+    if (content?.semanticSha256 !== expected.semanticManifestHash || content?.fileCount !== expected.fileCount || content?.symlinkCount !== 0)
+      return { accepted: false, code: "OPTIONAL_TREE_CONTENT_HASH_MISMATCH" };
+    if (content?.rawSha256 !== expected.rawManifestHashByUmask?.[content?.umask])
+      return { accepted: false, code: "OPTIONAL_TREE_RAW_MODE_MISMATCH" }; }
   const forbidden = /sharp-wasm32|@emnapi[\\/]runtime/i;
   if (input.native.requireCache.some((path) => forbidden.test(path))) return { accepted: false, code: "OPTIONAL_TREE_FORBIDDEN_MODULE_LOADED" };
   if (input.native.sharedObjects.some((path) => forbidden.test(path)) || input.native.wasmCalls.length) return { accepted: false, code: "OPTIONAL_TREE_WASM_LOADED" };
@@ -512,7 +520,6 @@ function auditFixture() {
       "@next/eslint-plugin-next": { severity: "high", via: ["fast-glob"], nodes: ["node_modules/@next/eslint-plugin-next"] },
       "@vitest/mocker": { severity: "moderate", via: [{ name: "@vitest/mocker", severity: "moderate", url: "https://github.com/advisories/GHSA-82fw-gwwq-j7x9" }], nodes: ["node_modules/vitest/node_modules/@vitest/mocker"] },
       braces: { severity: "high", via: [{ name: "braces", severity: "high", url: `https://github.com/advisories/${ALLOWED_ADVISORY}` }], nodes: ["node_modules/braces"] },
-      dompurify: { severity: "low", via: [{ name: "dompurify", severity: "low", url: "https://github.com/advisories/GHSA-p98j-92pf-mc4p" }], nodes: ["node_modules/dompurify"] },
       "drizzle-kit": { severity: "moderate", via: ["@esbuild-kit/esm-loader"], nodes: ["node_modules/drizzle-kit"] },
       esbuild: { severity: "moderate", via: [{ name: "esbuild", severity: "moderate", url: "https://github.com/advisories/GHSA-67mh-4wv8-2f99" }], nodes: ["node_modules/@esbuild-kit/core-utils/node_modules/esbuild"] },
       "eslint-config-next": { severity: "high", via: ["@next/eslint-plugin-next"], nodes: ["node_modules/eslint-config-next"] },
@@ -538,7 +545,10 @@ function optionalFixture() {
       sharp: { optionalDependencies: { "@img/sharp-webcontainers-wasm32": "0.35.5" } },
       sharpWebcontainers: { optional: true, cpu: ["wasm32"], dependencies: { "@img/sharp-wasm32": "0.35.5" } },
       sharpFreebsd: { optional: true, dependencies: { "@img/sharp-wasm32": "0.35.5" } } },
-    content: Object.fromEntries(Object.entries(OPTIONAL_PACKAGES).map(([name, value]) => [name, { sha256: value.contentHash, fileCount: value.fileCount }])),
+    content: Object.fromEntries(Object.entries(OPTIONAL_PACKAGES).map(([name, value]) => [name, {
+      semanticSha256: value.semanticManifestHash, rawSha256: value.rawManifestHashByUmask["0002"],
+      fileCount: value.fileCount, symlinkCount: 0, umask: "0002",
+    }])),
     native: { requireCache: ["/repo/node_modules/@img/sharp-linux-x64/index.cjs"],
       sharedObjects: ["/repo/node_modules/@img/sharp-linux-x64/lib/sharp-linux-x64-0.35.5.node"], wasmCalls: [], versions: { sharp: "0.35.5" },
       input: { width: 2, height: 3, format: "png" }, output: { width: 1, height: 1, format: "png", bytes: 90 } } };
@@ -547,14 +557,28 @@ async function runSelfTest() {
   const tests = [];
   function runCase(name, factory, mutate, decide, expectedCode) { const input = factory(); mutate(input); const decision = decide(input);
     tests.push({ name, expectedCode, actualCode: decision.code, passed: !decision.accepted && decision.code === expectedCode }); }
+  const hostedModeFixture = optionalFixture();
+  for (const [name, value] of Object.entries(OPTIONAL_PACKAGES)) {
+    hostedModeFixture.content[name].umask = "0022";
+    hostedModeFixture.content[name].rawSha256 = value.rawManifestHashByUmask["0022"];
+  }
   for (const [name, decision, code] of [["accept-security-exception", decideSecurity(auditFixture()), "SECURITY_EXCEPTION_ACCEPTED"],
-    ["accept-optional-tree-exception", decideOptional(optionalFixture()), "OPTIONAL_TREE_EXCEPTION_ACCEPTED"]])
+    ["accept-optional-tree-exception", decideOptional(optionalFixture()), "OPTIONAL_TREE_EXCEPTION_ACCEPTED"],
+    ["accept-hosted-mode-only-exception", decideOptional(hostedModeFixture), "OPTIONAL_TREE_EXCEPTION_ACCEPTED"]])
     tests.push({ name, expectedCode: code, actualCode: decision.code, passed: decision.accepted && decision.code === code });
   const optionalCases = [
     ["reject-third-extraneous", (x) => x.tree.anomalies.push({ type: "extraneous", name: "third", version: "1" }), "OPTIONAL_TREE_ANOMALY_SET_MISMATCH"],
     ["reject-wasm-version", (x) => { x.tree.roots["@img/sharp-wasm32"].version = "0.35.6"; }, "OPTIONAL_TREE_VERSION_MISMATCH"],
     ["reject-runtime-version", (x) => { x.tree.roots["@emnapi/runtime"].version = "1.11.4"; }, "OPTIONAL_TREE_VERSION_MISMATCH"],
-    ["reject-content-hash", (x) => { x.content["@img/sharp-wasm32"].sha256 = "0".repeat(64); }, "OPTIONAL_TREE_CONTENT_HASH_MISMATCH"],
+    ["reject-content-hash", (x) => { x.content["@img/sharp-wasm32"].semanticSha256 = "0".repeat(64); }, "OPTIONAL_TREE_CONTENT_HASH_MISMATCH"],
+    ["reject-content-size", (x) => { x.content["@img/sharp-wasm32"].semanticSha256 = "1".repeat(64); }, "OPTIONAL_TREE_CONTENT_HASH_MISMATCH"],
+    ["reject-content-path", (x) => { x.content["@img/sharp-wasm32"].semanticSha256 = "2".repeat(64); }, "OPTIONAL_TREE_CONTENT_HASH_MISMATCH"],
+    ["reject-content-kind", (x) => { x.content["@img/sharp-wasm32"].semanticSha256 = "3".repeat(64); }, "OPTIONAL_TREE_CONTENT_HASH_MISMATCH"],
+    ["reject-normalized-mode", (x) => { x.content["@img/sharp-wasm32"].semanticSha256 = "4".repeat(64); }, "OPTIONAL_TREE_CONTENT_HASH_MISMATCH"],
+    ["reject-added-or-removed-entry", (x) => { x.content["@img/sharp-wasm32"].fileCount += 1; }, "OPTIONAL_TREE_CONTENT_HASH_MISMATCH"],
+    ["reject-symlink-entry", (x) => { x.content["@img/sharp-wasm32"].symlinkCount = 1; }, "OPTIONAL_TREE_CONTENT_HASH_MISMATCH"],
+    ["reject-unapproved-raw-mode", (x) => { x.content["@img/sharp-wasm32"].rawSha256 = "5".repeat(64); }, "OPTIONAL_TREE_RAW_MODE_MISMATCH"],
+    ["reject-unapproved-umask", (x) => { x.content["@img/sharp-wasm32"].umask = "0077"; }, "OPTIONAL_TREE_RAW_MODE_MISMATCH"],
     ["reject-platform", (x) => { x.environment.platform = "darwin"; }, "OPTIONAL_TREE_PLATFORM_MISMATCH"],
     ["reject-arch", (x) => { x.environment.arch = "arm64"; }, "OPTIONAL_TREE_ARCH_MISMATCH"],
     ["reject-libc", (x) => { x.environment.libc = "musl"; }, "OPTIONAL_TREE_LIBC_MISMATCH"],
@@ -570,6 +594,30 @@ async function runSelfTest() {
     ["reject-toolchain-expiry", (x) => { x.nowMs = EXPIRES_AT_MS; }, "SECURITY_TOOLCHAIN_EXCEPTION_EXPIRED"],
   ];
   for (const [name, mutate, code] of optionalCases) runCase(name, optionalFixture, mutate, decideOptional, code);
+  const manifestEntry = { path: "file.bin", type: "regular", size: 4, normalizedMode: "0644",
+    sha256: "a".repeat(64), rawMode: "0664" };
+  const baselineManifestHashes = contentManifestHashes([manifestEntry]);
+  const hostedManifestHashes = contentManifestHashes([{ ...manifestEntry, rawMode: "0644" }]);
+  tests.push({ name: "mode-only-keeps-semantic-hash", expectedCode: "SEMANTIC_EQUAL_RAW_DIFFERENT",
+    actualCode: baselineManifestHashes.semanticSha256 === hostedManifestHashes.semanticSha256 &&
+      baselineManifestHashes.rawSha256 !== hostedManifestHashes.rawSha256 ? "SEMANTIC_EQUAL_RAW_DIFFERENT" : "HASH_INVARIANT_FAILED",
+    passed: baselineManifestHashes.semanticSha256 === hostedManifestHashes.semanticSha256 &&
+      baselineManifestHashes.rawSha256 !== hostedManifestHashes.rawSha256 });
+  const semanticManifestMutations = [
+    ["path", [{ ...manifestEntry, path: "other.bin" }]],
+    ["kind", [{ ...manifestEntry, type: "symlink", symlinkTarget: "file.bin" }]],
+    ["size", [{ ...manifestEntry, size: 5 }]],
+    ["bytes", [{ ...manifestEntry, sha256: "b".repeat(64) }]],
+    ["normalized-mode", [{ ...manifestEntry, normalizedMode: "0755" }]],
+    ["added", [manifestEntry, { ...manifestEntry, path: "second.bin" }]],
+    ["removed", []],
+  ];
+  for (const [field, entries] of semanticManifestMutations) {
+    const changed = contentManifestHashes(entries).semanticSha256;
+    tests.push({ name: `mode-only-rejects-${field}-drift`, expectedCode: "SEMANTIC_HASH_CHANGED",
+      actualCode: changed === baselineManifestHashes.semanticSha256 ? "SEMANTIC_HASH_UNCHANGED" : "SEMANTIC_HASH_CHANGED",
+      passed: changed !== baselineManifestHashes.semanticSha256 });
+  }
   const securityCases = [
     ["reject-production-high", (x) => { x.production.exitCode = 1; x.production.report.metadata.vulnerabilities.high = 1; x.production.report.vulnerabilities.production = { severity: "high", via: [], nodes: [] }; }, "PRODUCTION_HIGH_CRITICAL"],
     ["reject-braces-advisory", (x) => { x.full.report.vulnerabilities.braces.via[0].url = "https://github.com/advisories/GHSA-aaaa-bbbb-cccc"; }, "UNEXPECTED_HIGH_CRITICAL"],
@@ -578,10 +626,11 @@ async function runSelfTest() {
     ["reject-braces-production", (x) => { x.tree.report[0].dev = false; }, "SECURITY_EXCEPTION_CHAIN_MISMATCH"],
     ["reject-new-advisory", (x) => { x.full.report.vulnerabilities.unexpected = { severity: "high", via: [{ url: "https://github.com/advisories/GHSA-aaaa-bbbb-cccc" }], nodes: [] }; x.full.report.metadata.vulnerabilities.high = 6; x.full.report.metadata.vulnerabilities.total = 6; }, "UNEXPECTED_HIGH_CRITICAL"],
     ["reject-new-low-advisory", (x) => { x.full.report.vulnerabilities["unexpected-low"] = { severity: "low", via: [{ url: "https://github.com/advisories/GHSA-dddd-eeee-ffff" }], nodes: ["node_modules/unexpected-low"] }; x.full.report.metadata.vulnerabilities.low = 2; x.full.report.metadata.vulnerabilities.total = 13; }, "FULL_AUDIT_ADVISORY_SET_MISMATCH"],
+    ["reject-dompurify-advisory-regression", (x) => { x.full.report.vulnerabilities.dompurify = { severity: "low", via: [{ url: "https://github.com/advisories/GHSA-p98j-92pf-mc4p" }], nodes: ["node_modules/dompurify"] }; x.full.report.metadata.vulnerabilities.low = 1; x.full.report.metadata.vulnerabilities.total = 12; }, "FULL_AUDIT_ADVISORY_SET_MISMATCH"],
     ["reject-new-moderate-advisory", (x) => { x.full.report.vulnerabilities["unexpected-moderate"] = { severity: "moderate", via: [{ url: "https://github.com/advisories/GHSA-aaaa-bbbb-cccc" }], nodes: ["node_modules/unexpected-moderate"] }; x.full.report.metadata.vulnerabilities.moderate = 7; x.full.report.metadata.vulnerabilities.total = 13; }, "FULL_AUDIT_ADVISORY_SET_MISMATCH"],
-    ["reject-unresolved-advisory", (x) => { x.full.report.vulnerabilities.dompurify.via = ["missing-vulnerability"]; }, "FULL_AUDIT_UNRESOLVED_ADVISORY"],
-    ["reject-severity-drift", (x) => { x.full.report.vulnerabilities.dompurify.severity = "moderate"; }, "FULL_AUDIT_MAPPING_MISMATCH"],
-    ["reject-node-drift", (x) => { x.full.report.vulnerabilities.dompurify.nodes.push("node_modules/other-dompurify"); }, "FULL_AUDIT_MAPPING_MISMATCH"],
+    ["reject-unresolved-advisory", (x) => { x.full.report.vulnerabilities["@vitest/mocker"].via = ["missing-vulnerability"]; }, "FULL_AUDIT_UNRESOLVED_ADVISORY"],
+    ["reject-severity-drift", (x) => { x.full.report.vulnerabilities["@vitest/mocker"].severity = "low"; }, "FULL_AUDIT_MAPPING_MISMATCH"],
+    ["reject-node-drift", (x) => { x.full.report.vulnerabilities["@vitest/mocker"].nodes.push("node_modules/other-mocker"); }, "FULL_AUDIT_MAPPING_MISMATCH"],
     ["reject-security-expiry", (x) => { x.nowMs = EXPIRES_AT_MS; }, "SECURITY_EXCEPTION_EXPIRED"],
   ];
   for (const [name, mutate, code] of securityCases) runCase(name, auditFixture, mutate, decideSecurity, code);
@@ -721,8 +770,8 @@ async function runSelfTest() {
   const manifestFieldsValid = liveDiagnostic.manifest.every((item) => {
     const actual = Object.keys(item).sort();
     const expected = (item.type === "regular"
-      ? ["normalizedMode", "package", "path", "rawMode", "sha256", "type"]
-      : ["normalizedMode", "package", "path", "rawMode", "symlinkTarget", "type"]).sort();
+      ? ["normalizedMode", "package", "path", "rawMode", "sha256", "size", "type"]
+      : ["normalizedMode", "package", "path", "rawMode", "size", "symlinkTarget", "type"]).sort();
     return JSON.stringify(actual) === JSON.stringify(expected);
   });
   const leakedRoots = [REPO_ROOT, process.env.RUNNER_TEMP, process.env.HOME].filter(Boolean)
@@ -747,7 +796,7 @@ async function normalEvidence() {
   for (const field of DECLARATION_FIELDS) for (const name of Object.keys(OPTIONAL_PACKAGES)) if (rootManifest[field]?.[name] !== undefined)
     rootDeclarations.push({ field, name, spec: rootManifest[field][name] });
   const content = {};
-  for (const [name, expected] of Object.entries(OPTIONAL_PACKAGES)) try { content[name] = await packageContentHash(resolve(REPO_ROOT, expected.path)); }
+  for (const [name, expected] of Object.entries(OPTIONAL_PACKAGES)) try { content[name] = await packageContentHash(name, resolve(REPO_ROOT, expected.path)); }
     catch (error) { content[name] = { error: error instanceof Error ? error.message : String(error) }; }
   const report = process.report.getReport(), environment = { node: process.version,
     npm: npmVersion.exitCode === 0 ? npmVersion.stdout.trim() : null, platform: process.platform, arch: process.arch,
