@@ -3,10 +3,11 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, readFile, readdir, readlink } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const POLICY_VERSION = "isme-security-policy-v3";
+const POLICY_VERSION = "isme-security-policy-v5-bounded-decoding";
 const ALLOWED_ADVISORY = "GHSA-vfj7-8cjw-p6xm";
 const EXPIRES_AT = "2026-10-19T00:00:00+08:00";
 const EXPIRES_AT_MS = Date.parse(EXPIRES_AT);
@@ -51,9 +52,18 @@ const OPTIONAL_PACKAGES = {
 const EXPECTED_EXTRANEOUS = Object.entries(OPTIONAL_PACKAGES)
   .map(([name, value]) => ({ name, version: value.version })).sort((a, b) => a.name.localeCompare(b.name));
 const DECLARATION_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
+const DIAGNOSTIC_CONFIG_KEYS = [
+  "cache", "prefix", "install-strategy", "legacy-peer-deps", "omit", "include", "ignore-scripts",
+  "foreground-scripts", "bin-links", "platform", "arch", "libc",
+];
+const UNSAFE_SYMLINK_TARGET = "<UNSAFE_SYMLINK_TARGET>";
+const NORMALIZED_MODE_RULE = "regular executable=>0755; regular non-executable=>0644; symlink=>0777";
+const DIAGNOSTIC_VALUE_MAX_BYTES = 4096;
+const DIAGNOSTIC_MAX_DECODE_DEPTH = 3;
 
-function runCommand(command, args) {
-  const result = spawnSync(command, args, { cwd: REPO_ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+function runCommand(command, args, options = {}) {
+  const result = spawnSync(command, args, { cwd: options.cwd ?? REPO_ROOT, env: options.env ?? process.env,
+    encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   return { command: [command, ...args], exitCode: result.status, signal: result.signal,
     stdout: result.stdout ?? "", stderr: result.stderr ?? "",
     error: result.error ? { code: result.error.code ?? null, message: result.error.message } : null };
@@ -149,6 +159,191 @@ const utf8Compare = (a, b) => Buffer.from(a).compare(Buffer.from(b));
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const canonical = (value) => JSON.stringify(value, (_key, item) => !item || Array.isArray(item) || typeof item !== "object"
   ? item : Object.fromEntries(Object.entries(item).sort(([a], [b]) => utf8Compare(a, b))));
+function diagnosticError(code) { const error = new Error(code); error.code = code; return error; }
+function decodeUtf8(value) {
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
+  let decoded;
+  try { decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { throw diagnosticError("DIAGNOSTIC_PATH_NOT_UTF8"); }
+  if (!Buffer.from(decoded, "utf8").equals(bytes)) throw diagnosticError("DIAGNOSTIC_PATH_NOT_UTF8");
+  return decoded;
+}
+function validatePackageRelativePath(path) {
+  if (typeof path !== "string" || !path || path.includes("\0") || Buffer.from(path, "utf8").toString("utf8") !== path ||
+      path.startsWith("/") || path.startsWith("\\\\") || /^[A-Za-z]:[\\/]/.test(path))
+    throw diagnosticError("DIAGNOSTIC_PATH_INVALID");
+  const parts = path.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) throw diagnosticError("DIAGNOSTIC_PATH_INVALID");
+  return path;
+}
+const fourDigitMode = (mode) => (mode & 0o7777).toString(8).padStart(4, "0");
+function normalizedMode(type, mode) {
+  if (type === "regular") return mode & 0o111 ? "0755" : "0644";
+  if (type === "symlink") return "0777";
+  throw diagnosticError("DIAGNOSTIC_TYPE_UNSUPPORTED");
+}
+function withinRoot(root, candidate) {
+  const rel = relative(root, candidate);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+function safeSymlinkTarget(root, packagePath, target) {
+  if (typeof target !== "string" || !target || target.includes("\0") || Buffer.from(target, "utf8").toString("utf8") !== target ||
+      target.startsWith("/") || target.startsWith("\\\\") || /^[A-Za-z]:[\\/]/.test(target))
+    return { safe: false, value: UNSAFE_SYMLINK_TARGET };
+  const destination = resolve(dirname(resolve(root, packagePath)), target);
+  return withinRoot(root, destination) ? { safe: true, value: target } : { safe: false, value: UNSAFE_SYMLINK_TARGET };
+}
+async function packageDiagnosticManifest(packageName, root) {
+  const manifest = [], errors = [];
+  async function walk(directory, parentParts = []) {
+    const children = (await readdir(directory, { withFileTypes: true, encoding: "buffer" }))
+      .sort((a, b) => Buffer.compare(a.name, b.name));
+    for (const child of children) {
+      let name;
+      try { name = decodeUtf8(child.name); }
+      catch (error) { errors.push({ package: packageName, code: error.code ?? "DIAGNOSTIC_PATH_NOT_UTF8" }); continue; }
+      if (name === "node_modules" && child.isDirectory()) continue;
+      const parts = [...parentParts, name], packagePath = parts.join("/");
+      try { validatePackageRelativePath(packagePath); }
+      catch (error) { errors.push({ package: packageName, code: error.code ?? "DIAGNOSTIC_PATH_INVALID" }); continue; }
+      const absolutePath = resolve(directory, name);
+      if (!withinRoot(root, absolutePath)) { errors.push({ package: packageName, code: "DIAGNOSTIC_PATH_ESCAPE" }); continue; }
+      const stats = await lstat(absolutePath);
+      if (stats.isDirectory()) { await walk(absolutePath, parts); continue; }
+      if (stats.isFile()) {
+        manifest.push({ package: packageName, path: packagePath, type: "regular", rawMode: fourDigitMode(stats.mode),
+          normalizedMode: normalizedMode("regular", stats.mode), sha256: sha256(await readFile(absolutePath)) });
+        continue;
+      }
+      if (stats.isSymbolicLink()) {
+        let target;
+        try { target = decodeUtf8(await readlink(absolutePath, { encoding: "buffer" })); }
+        catch { target = null; }
+        const safeTarget = safeSymlinkTarget(root, packagePath, target);
+        if (!safeTarget.safe) errors.push({ package: packageName, code: "DIAGNOSTIC_SYMLINK_TARGET_UNSAFE" });
+        manifest.push({ package: packageName, path: packagePath, type: "symlink", rawMode: fourDigitMode(stats.mode),
+          normalizedMode: normalizedMode("symlink", stats.mode), symlinkTarget: safeTarget.value });
+        continue;
+      }
+      errors.push({ package: packageName, code: "DIAGNOSTIC_TYPE_UNSUPPORTED" });
+    }
+  }
+  await walk(root);
+  manifest.sort((a, b) => utf8Compare(a.package, b.package) || utf8Compare(a.path, b.path));
+  errors.sort((a, b) => utf8Compare(a.package, b.package) || utf8Compare(a.code, b.code));
+  return { manifest, errors };
+}
+function validateDiagnosticConfigKeys(keys) {
+  if (!Array.isArray(keys) || keys.length !== DIAGNOSTIC_CONFIG_KEYS.length ||
+      keys.some((key, index) => key !== DIAGNOSTIC_CONFIG_KEYS[index])) throw diagnosticError("DIAGNOSTIC_NPM_CONFIG_KEY_NOT_ALLOWED");
+  return keys;
+}
+function assertNoSensitiveDiagnosticPath(value, decoder = decodeURIComponent) {
+  const unsafe = () => { throw diagnosticError("DIAGNOSTIC_NPM_CONFIG_VALUE_UNSAFE"); };
+  const inspect = (candidate) => {
+    if (typeof candidate !== "string" || Buffer.byteLength(candidate, "utf8") > DIAGNOSTIC_VALUE_MAX_BYTES ||
+        /[\u0000-\u001f\u007f-\u009f]/u.test(candidate) || /%(?![0-9a-f]{2})/i.test(candidate) ||
+        /%(?:2f|5c)/i.test(candidate)) unsafe();
+    const normalized = candidate.replaceAll("\\", "/");
+    if (/(?:^|\/)[a-z][a-z0-9+.-]*:\/{1,2}[^\/\s]*@[^\/\s]+/i.test(normalized) ||
+        /(?:^|\/)[^\/\s:@]+:[^\/\s@]+@[^\/\s]+(?:\/|$)/.test(normalized) ||
+        /(?:^|[^a-z0-9])(?:access[-_]?token|auth[-_]?token|token|password|passwd|secret|credential|authorization|bearer|api[-_]?key|private[-_]?key|proxy)(?:[^a-z0-9]|$)/i.test(normalized) ||
+        /(?:gh[pousr]_[a-z0-9]{20,}|github_pat_[a-z0-9_]{20,}|npm_[a-z0-9]{20,}|sk-[a-z0-9_-]{16,})/i.test(normalized)) unsafe();
+  };
+  let current = value;
+  inspect(current);
+  for (let depth = 1; depth <= DIAGNOSTIC_MAX_DECODE_DEPTH; depth += 1) {
+    if (!current.includes("%")) return;
+    let decoded;
+    try { decoded = decoder(current); } catch { unsafe(); }
+    if (typeof decoded !== "string" || Buffer.byteLength(decoded, "utf8") > Buffer.byteLength(current, "utf8")) unsafe();
+    current = decoded;
+    inspect(current);
+  }
+  if (current.includes("%")) {
+    let next;
+    try { next = decoder(current); } catch { unsafe(); }
+    if (next !== current) unsafe();
+  }
+}
+function redactDiagnosticPath(value, roots) {
+  assertNoSensitiveDiagnosticPath(value);
+  if (!value) return value;
+  const candidates = roots.filter(({ path }) => typeof path === "string" && path.startsWith("/"))
+    .sort((a, b) => b.path.length - a.path.length);
+  for (const candidate of candidates) {
+    const rel = relative(candidate.path, value);
+    if (rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`))) {
+      const suffix = rel ? `/${validatePackageRelativePath(rel.split(sep).join("/"))}` : "";
+      assertNoSensitiveDiagnosticPath(suffix);
+      const redacted = `${candidate.placeholder}${suffix}`;
+      assertNoSensitiveDiagnosticPath(redacted);
+      return redacted;
+    }
+  }
+  if (value.startsWith("/")) return "<ABSOLUTE_PATH>";
+  const redacted = validatePackageRelativePath(value);
+  assertNoSensitiveDiagnosticPath(redacted);
+  return redacted;
+}
+function sanitizeDiagnosticConfigValue(key, value, roots) {
+  if (["cache", "prefix"].includes(key)) return redactDiagnosticPath(value, roots);
+  if (typeof value !== "string" || value.includes("\n") || value.includes("\r") || value.includes("://") ||
+      /token|password|cookie|credential|authorization|proxy/i.test(value)) throw diagnosticError("DIAGNOSTIC_NPM_CONFIG_VALUE_UNSAFE");
+  if (key === "install-strategy" && !["hoisted", "nested", "shallow", "linked"].includes(value))
+    throw diagnosticError("DIAGNOSTIC_NPM_CONFIG_VALUE_INVALID");
+  if (["legacy-peer-deps", "ignore-scripts", "foreground-scripts", "bin-links"].includes(key) && !["true", "false"].includes(value))
+    throw diagnosticError("DIAGNOSTIC_NPM_CONFIG_VALUE_INVALID");
+  if (["omit", "include"].includes(key) && !/^(?:|dev|optional|peer|prod)(?:,(?:dev|optional|peer|prod))*$/.test(value))
+    throw diagnosticError("DIAGNOSTIC_NPM_CONFIG_VALUE_INVALID");
+  if (["platform", "arch", "libc"].includes(key) && !/^(?:undefined|null|[a-z0-9._-]+)$/i.test(value))
+    throw diagnosticError("DIAGNOSTIC_NPM_CONFIG_VALUE_INVALID");
+  return value;
+}
+function readSafeNpmConfig(keys = DIAGNOSTIC_CONFIG_KEYS, commandRunner = runCommand, rawConfig = process.env) {
+  validateDiagnosticConfigKeys(keys);
+  const roots = [
+    { placeholder: "<WORKSPACE>", path: REPO_ROOT },
+    { placeholder: "<RUNNER_TEMP>", path: process.env.RUNNER_TEMP },
+    { placeholder: "<HOME>", path: process.env.HOME },
+  ];
+  const config = {};
+  for (const key of keys) {
+    if (["cache", "prefix"].includes(key)) for (const rawKey of [`npm_config_${key}`, `NPM_CONFIG_${key.toUpperCase()}`])
+      if (typeof rawConfig?.[rawKey] === "string") assertNoSensitiveDiagnosticPath(rawConfig[rawKey]);
+    const result = commandRunner("npm", ["config", "get", key]);
+    if (result.exitCode !== 0 || result.error) throw diagnosticError("DIAGNOSTIC_NPM_CONFIG_READ_FAILED");
+    const value = result.stdout.replace(/(?:\r?\n)$/, "");
+    config[key] = sanitizeDiagnosticConfigValue(key, value, roots);
+  }
+  return config;
+}
+function attachContentHashDiagnostic(evidence, diagnostic) {
+  if (evidence.decision?.code !== "OPTIONAL_TREE_CONTENT_HASH_MISMATCH") return evidence;
+  return { ...evidence, diagnostic };
+}
+const evidenceExitCode = (evidence) => evidence.decision?.accepted === true ? 0 : 1;
+async function buildContentHashDiagnostic(environment, configReader = readSafeNpmConfig) {
+  let npmConfig;
+  try { npmConfig = configReader(); }
+  catch (error) {
+    return { schema: "optional-tree-content-manifest-v1", reason: "OPTIONAL_TREE_CONTENT_HASH_MISMATCH", valid: false,
+      npmConfig: null, errors: [{ package: "<environment>", code: error.code ?? "DIAGNOSTIC_NPM_CONFIG_READ_FAILED" }] };
+  }
+  const manifest = [], errors = [];
+  for (const [packageName, expected] of Object.entries(OPTIONAL_PACKAGES).sort(([a], [b]) => utf8Compare(a, b))) {
+    try {
+      const result = await packageDiagnosticManifest(packageName, resolve(REPO_ROOT, expected.path));
+      manifest.push(...result.manifest); errors.push(...result.errors);
+    } catch (error) { errors.push({ package: packageName, code: error.code ?? "DIAGNOSTIC_MANIFEST_READ_FAILED" }); }
+  }
+  errors.sort((a, b) => utf8Compare(a.package, b.package) || utf8Compare(a.code, b.code));
+  return { schema: "optional-tree-content-manifest-v1", reason: "OPTIONAL_TREE_CONTENT_HASH_MISMATCH",
+    valid: errors.length === 0, normalizedModeRule: NORMALIZED_MODE_RULE,
+    environment: { node: environment.node, npm: environment.npm, platform: environment.platform,
+      arch: environment.arch, libc: environment.libc, umask: fourDigitMode(process.umask()) },
+    npmConfig, manifest, errors };
+}
 async function packageContentHash(root) {
   const entries = [];
   async function walk(directory) {
@@ -348,7 +543,7 @@ function optionalFixture() {
       sharedObjects: ["/repo/node_modules/@img/sharp-linux-x64/lib/sharp-linux-x64-0.35.5.node"], wasmCalls: [], versions: { sharp: "0.35.5" },
       input: { width: 2, height: 3, format: "png" }, output: { width: 1, height: 1, format: "png", bytes: 90 } } };
 }
-function runSelfTest() {
+async function runSelfTest() {
   const tests = [];
   function runCase(name, factory, mutate, decide, expectedCode) { const input = factory(); mutate(input); const decision = decide(input);
     tests.push({ name, expectedCode, actualCode: decision.code, passed: !decision.accepted && decision.code === expectedCode }); }
@@ -390,6 +585,153 @@ function runSelfTest() {
     ["reject-security-expiry", (x) => { x.nowMs = EXPIRES_AT_MS; }, "SECURITY_EXCEPTION_EXPIRED"],
   ];
   for (const [name, mutate, code] of securityCases) runCase(name, auditFixture, mutate, decideSecurity, code);
+  const diagnosticFixture = { schema: "optional-tree-content-manifest-v1", valid: true, manifest: [] };
+  const acceptedEvidence = attachContentHashDiagnostic({ decision: { accepted: true, code: "OPTIONAL_TREE_EXCEPTION_ACCEPTED" } }, diagnosticFixture);
+  tests.push({ name: "diagnostic-absent-on-accepted", expectedCode: "NO_DIAGNOSTIC", actualCode: Object.hasOwn(acceptedEvidence, "diagnostic") ? "DIAGNOSTIC_PRESENT" : "NO_DIAGNOSTIC",
+    passed: !Object.hasOwn(acceptedEvidence, "diagnostic") });
+  const otherFailure = attachContentHashDiagnostic({ decision: { accepted: false, code: "OPTIONAL_TREE_VERSION_MISMATCH" } }, diagnosticFixture);
+  tests.push({ name: "diagnostic-absent-on-other-failure", expectedCode: "NO_DIAGNOSTIC", actualCode: Object.hasOwn(otherFailure, "diagnostic") ? "DIAGNOSTIC_PRESENT" : "NO_DIAGNOSTIC",
+    passed: !Object.hasOwn(otherFailure, "diagnostic") });
+  const mismatchEvidence = attachContentHashDiagnostic({ decision: { accepted: false, code: "OPTIONAL_TREE_CONTENT_HASH_MISMATCH" } }, diagnosticFixture);
+  tests.push({ name: "diagnostic-preserves-mismatch-failure", expectedCode: "OPTIONAL_TREE_CONTENT_HASH_MISMATCH", actualCode: mismatchEvidence.decision.code,
+    passed: evidenceExitCode(mismatchEvidence) === 1 && !mismatchEvidence.decision.accepted &&
+      mismatchEvidence.decision.code === "OPTIONAL_TREE_CONTENT_HASH_MISMATCH" && mismatchEvidence.diagnostic === diagnosticFixture });
+  const redacted = redactDiagnosticPath("/runner/temp/npm-cache", [{ placeholder: "<RUNNER_TEMP>", path: "/runner/temp" }]);
+  tests.push({ name: "diagnostic-redacts-layout-path", expectedCode: "<RUNNER_TEMP>/npm-cache", actualCode: redacted,
+    passed: redacted === "<RUNNER_TEMP>/npm-cache" && !redacted.includes("/runner/temp") });
+  const outsidePath = redactDiagnosticPath("/opt/toolchain", [{ placeholder: "<HOME>", path: "/home/runner" }]);
+  tests.push({ name: "diagnostic-redacts-unknown-absolute-path", expectedCode: "<ABSOLUTE_PATH>", actualCode: outsidePath,
+    passed: outsidePath === "<ABSOLUTE_PATH>" });
+  for (const [name, path] of [["diagnostic-rejects-absolute-path", "/etc/passwd"], ["diagnostic-rejects-parent-path", "lib/../secret"]]) {
+    let code = null; try { validatePackageRelativePath(path); } catch (error) { code = error.code; }
+    tests.push({ name, expectedCode: "DIAGNOSTIC_PATH_INVALID", actualCode: code, passed: code === "DIAGNOSTIC_PATH_INVALID" });
+  }
+  const escapingTarget = safeSymlinkTarget("/package", "lib/link", "../../outside");
+  tests.push({ name: "diagnostic-redacts-escaping-symlink", expectedCode: UNSAFE_SYMLINK_TARGET, actualCode: escapingTarget.value,
+    passed: !escapingTarget.safe && escapingTarget.value === UNSAFE_SYMLINK_TARGET });
+  const internalTarget = safeSymlinkTarget("/package", "lib/link", "../index.js");
+  tests.push({ name: "diagnostic-keeps-internal-symlink", expectedCode: "../index.js", actualCode: internalTarget.value,
+    passed: internalTarget.safe && internalTarget.value === "../index.js" });
+  let unknownConfigCode = null;
+  try { validateDiagnosticConfigKeys([...DIAGNOSTIC_CONFIG_KEYS.slice(0, -1), "registry"]); }
+  catch (error) { unknownConfigCode = error.code; }
+  tests.push({ name: "diagnostic-rejects-unknown-config", expectedCode: "DIAGNOSTIC_NPM_CONFIG_KEY_NOT_ALLOWED", actualCode: unknownConfigCode,
+    passed: unknownConfigCode === "DIAGNOSTIC_NPM_CONFIG_KEY_NOT_ALLOWED" });
+  let sensitiveConfigCode = null;
+  try { sanitizeDiagnosticConfigValue("platform", "https://user:token@example.invalid", []); }
+  catch (error) { sensitiveConfigCode = error.code; }
+  tests.push({ name: "diagnostic-rejects-sensitive-config-value", expectedCode: "DIAGNOSTIC_NPM_CONFIG_VALUE_UNSAFE", actualCode: sensitiveConfigCode,
+    passed: sensitiveConfigCode === "DIAGNOSTIC_NPM_CONFIG_VALUE_UNSAFE" });
+  const reversibleLayers = (value) => {
+    const layers = [value]; let current = value;
+    for (let depth = 0; depth < DIAGNOSTIC_MAX_DECODE_DEPTH + 2 && current.includes("%"); depth += 1) {
+      try { current = decodeURIComponent(current); } catch { break; }
+      layers.push(current);
+    }
+    return [...new Set(layers.filter((item) => Buffer.byteLength(item, "utf8") >= 8))];
+  };
+  const pushUnsafeDiagnosticCase = (name, operation, markers) => {
+    let code = null;
+    try { operation(); } catch (error) { code = error.code ?? "DIAGNOSTIC_NPM_CONFIG_READ_FAILED"; }
+    const diagnostic = { schema: "optional-tree-content-manifest-v1", reason: "OPTIONAL_TREE_CONTENT_HASH_MISMATCH",
+      valid: false, npmConfig: null, errors: [{ package: "<environment>", code }] };
+    const evidence = attachContentHashDiagnostic(
+      { decision: { accepted: false, code: "OPTIONAL_TREE_CONTENT_HASH_MISMATCH" } }, diagnostic);
+    const serialized = JSON.stringify(evidence);
+    tests.push({ name, expectedCode: "DIAGNOSTIC_NPM_CONFIG_VALUE_UNSAFE", actualCode: code,
+      passed: code === "DIAGNOSTIC_NPM_CONFIG_VALUE_UNSAFE" && evidenceExitCode(evidence) === 1 &&
+        evidence.decision.code === "OPTIONAL_TREE_CONTENT_HASH_MISMATCH" && evidence.diagnostic.valid === false &&
+        !Object.hasOwn(evidence.diagnostic, "manifest") && markers.every((marker) => !serialized.includes(marker)) });
+  };
+  const safeConfigValues = {
+    cache: resolve(tmpdir(), "isme-policy-safe-cache"), prefix: resolve(tmpdir(), "isme-policy-safe-prefix"),
+    "install-strategy": "hoisted", "legacy-peer-deps": "false", omit: "", include: "", "ignore-scripts": "false",
+    "foreground-scripts": "false", "bin-links": "true", platform: "linux", arch: "x64", libc: "glibc",
+  };
+  const safeCommandRunner = (_command, commandArgs) => ({ exitCode: 0, error: null,
+    stdout: `${safeConfigValues[commandArgs.at(-1)]}\n`, stderr: "" });
+  for (const key of ["cache", "prefix"]) {
+    const credentialUrl = `https://user:token@example.invalid/private-${key}`;
+    let encoded = credentialUrl;
+    for (let depth = 1; depth <= DIAGNOSTIC_MAX_DECODE_DEPTH + 1; depth += 1) {
+      encoded = encodeURIComponent(encoded);
+      const injectedEnv = {
+        ...process.env,
+        npm_config_cache: key === "cache" ? encoded : safeConfigValues.cache,
+        npm_config_prefix: key === "prefix" ? encoded : safeConfigValues.prefix,
+        npm_config_logs_dir: resolve(tmpdir(), "isme-policy-self-test-logs"),
+        npm_config_update_notifier: "false",
+      };
+      const commandRunner = (command, commandArgs) => runCommand(command, commandArgs, { cwd: tmpdir(), env: injectedEnv });
+      const markers = reversibleLayers(encoded);
+      pushUnsafeDiagnosticCase(`diagnostic-rejects-normalized-${key}-depth-${depth}`,
+        () => readSafeNpmConfig(DIAGNOSTIC_CONFIG_KEYS, commandRunner, {}), markers);
+      if (depth === 2) for (const [rawName, rawKey] of [["lower", `npm_config_${key}`], ["upper", `NPM_CONFIG_${key.toUpperCase()}`]])
+        pushUnsafeDiagnosticCase(`diagnostic-rejects-raw-${key}-${rawName}`,
+          () => readSafeNpmConfig(DIAGNOSTIC_CONFIG_KEYS, safeCommandRunner, { [rawKey]: encoded }), markers);
+    }
+    const singleEncoded = encodeURIComponent(credentialUrl);
+    const lowerCaseEncoding = singleEncoded.replace(/%[0-9A-F]{2}/g, (escape) => escape.toLowerCase());
+    const mixedCaseEncoding = singleEncoded.replace(/%[0-9A-F]{2}/g, (escape, offset) => offset % 2 ? escape.toLowerCase() : escape);
+    for (const [variant, value] of [["lowercase", lowerCaseEncoding], ["mixedcase", mixedCaseEncoding]])
+      pushUnsafeDiagnosticCase(`diagnostic-rejects-${key}-${variant}`, () => sanitizeDiagnosticConfigValue(key, value, []), reversibleLayers(value));
+    for (const [shape, value] of [["unix", `/var/cache/${singleEncoded}`], ["windows", `C:\\cache\\${singleEncoded}`],
+      ["encoded-slash", "cache%2fprivate"], ["encoded-backslash", "cache%5Cprivate"], ["invalid-percent", "cache/%2"],
+      ["decode-error", "cache/%e0%a4"], ["c0-control", "cache/\u0001private"], ["c1-control", "cache/\u0085private"],
+      ["token-signature", `cache/npm_${"a".repeat(24)}`]])
+      pushUnsafeDiagnosticCase(`diagnostic-rejects-${key}-${shape}`, () => sanitizeDiagnosticConfigValue(key, value, []), reversibleLayers(value));
+    const exactBoundary = "a".repeat(DIAGNOSTIC_VALUE_MAX_BYTES);
+    let boundaryCode = "SAFE";
+    try { assertNoSensitiveDiagnosticPath(exactBoundary); } catch (error) { boundaryCode = error.code; }
+    tests.push({ name: `diagnostic-allows-${key}-4096-byte-boundary`, expectedCode: "SAFE", actualCode: boundaryCode,
+      passed: boundaryCode === "SAFE" });
+    const oversized = `${exactBoundary}a`;
+    pushUnsafeDiagnosticCase(`diagnostic-rejects-${key}-oversized`, () => assertNoSensitiveDiagnosticPath(oversized), [oversized]);
+  }
+  const depthLimitValue = "%25252574oken-material";
+  pushUnsafeDiagnosticCase("diagnostic-rejects-semantic-change-after-depth-limit",
+    () => assertNoSensitiveDiagnosticPath(depthLimitValue), reversibleLayers(depthLimitValue));
+  pushUnsafeDiagnosticCase("diagnostic-rejects-decoded-length-expansion",
+    () => assertNoSensitiveDiagnosticPath("safe%20value", () => "x".repeat(64)), ["safe%20value"]);
+  const placeholderCases = [
+    ["workspace", "/workspace/cache", [{ placeholder: "<WORKSPACE>", path: "/workspace" }], "<WORKSPACE>/cache"],
+    ["runner-temp", "/runner/temp/cache", [{ placeholder: "<RUNNER_TEMP>", path: "/runner/temp" }], "<RUNNER_TEMP>/cache"],
+    ["home", "/home/runner/cache", [{ placeholder: "<HOME>", path: "/home/runner" }], "<HOME>/cache"],
+    ["absolute", "/opt/cache", [{ placeholder: "<HOME>", path: "/home/runner" }], "<ABSOLUTE_PATH>"],
+  ];
+  for (const [name, value, roots, expected] of placeholderCases) {
+    const actual = redactDiagnosticPath(value, roots);
+    tests.push({ name: `diagnostic-keeps-${name}-placeholder-scope`, expectedCode: expected, actualCode: actual, passed: actual === expected });
+  }
+  const blockedDiagnostic = await buildContentHashDiagnostic(
+    { node: "v22.23.2", npm: "10.9.9", platform: "linux", arch: "x64", libc: "glibc" },
+    () => { throw diagnosticError("DIAGNOSTIC_NPM_CONFIG_VALUE_UNSAFE"); });
+  tests.push({ name: "diagnostic-unsafe-config-stops-before-manifest", expectedCode: "DIAGNOSTIC_NPM_CONFIG_VALUE_UNSAFE",
+    actualCode: blockedDiagnostic.errors?.[0]?.code,
+    passed: blockedDiagnostic.valid === false && !Object.hasOwn(blockedDiagnostic, "manifest") &&
+      !Object.hasOwn(blockedDiagnostic, "environment") && blockedDiagnostic.errors?.[0]?.code === "DIAGNOSTIC_NPM_CONFIG_VALUE_UNSAFE" });
+  tests.push({ name: "diagnostic-normalizes-modes", expectedCode: NORMALIZED_MODE_RULE,
+    actualCode: `${normalizedMode("regular", 0o100644)},${normalizedMode("regular", 0o100755)},${normalizedMode("symlink", 0o120777)}`,
+    passed: fourDigitMode(0o100644) === "0644" && normalizedMode("regular", 0o100644) === "0644" &&
+      normalizedMode("regular", 0o100755) === "0755" && normalizedMode("symlink", 0o120777) === "0777" });
+  const runtimeReport = process.report.getReport();
+  const liveDiagnostic = await buildContentHashDiagnostic({ node: process.version, npm: runCommand("npm", ["--version"]).stdout.trim(),
+    platform: process.platform, arch: process.arch, libc: runtimeReport.header.glibcVersionRuntime ? "glibc" : "unknown" });
+  const serializedDiagnostic = JSON.stringify(liveDiagnostic);
+  const manifestFieldsValid = liveDiagnostic.manifest.every((item) => {
+    const actual = Object.keys(item).sort();
+    const expected = (item.type === "regular"
+      ? ["normalizedMode", "package", "path", "rawMode", "sha256", "type"]
+      : ["normalizedMode", "package", "path", "rawMode", "symlinkTarget", "type"]).sort();
+    return JSON.stringify(actual) === JSON.stringify(expected);
+  });
+  const leakedRoots = [REPO_ROOT, process.env.RUNNER_TEMP, process.env.HOME].filter(Boolean)
+    .filter((root) => serializedDiagnostic.includes(root));
+  tests.push({ name: "diagnostic-live-manifest-safe", expectedCode: "LIVE_DIAGNOSTIC_SAFE", actualCode: liveDiagnostic.valid ? "LIVE_DIAGNOSTIC_SAFE" : "LIVE_DIAGNOSTIC_INVALID",
+    passed: liveDiagnostic.valid && liveDiagnostic.manifest.length === Object.values(OPTIONAL_PACKAGES).reduce((sum, item) => sum + item.fileCount, 0) &&
+      JSON.stringify([...new Set(liveDiagnostic.manifest.map((item) => item.package))].sort()) === JSON.stringify(Object.keys(OPTIONAL_PACKAGES).sort()) &&
+      manifestFieldsValid && JSON.stringify(Object.keys(liveDiagnostic.npmConfig ?? {})) === JSON.stringify(DIAGNOSTIC_CONFIG_KEYS) &&
+      /^0[0-7]{3}$/.test(liveDiagnostic.environment.umask) && leakedRoots.length === 0 });
   const passed = tests.every((test) => test.passed);
   process.stdout.write(`${JSON.stringify({ policyVersion: POLICY_VERSION, mode: "self-test", decision: { accepted: passed, code: passed ? "SELF_TEST_PASSED" : "SELF_TEST_FAILED" }, tests }, null, 2)}\n`);
   return passed ? 0 : 1;
@@ -416,7 +758,7 @@ async function normalEvidence() {
   const full = { jsonValid: fullResult.jsonValid, exitCode: fullResult.exitCode, report: fullResult.parsed };
   const securityTree = { jsonValid: explainResult.jsonValid, exitCode: explainResult.exitCode, report: explainResult.parsed };
   const securityDecision = decideSecurity({ production, full, tree: securityTree, nowMs }), optionalDecision = decideOptional(optionalInput);
-  return { policyVersion: POLICY_VERSION, generatedAt: new Date(nowMs).toISOString(), expiresAt: EXPIRES_AT, environment,
+  const evidence = { policyVersion: POLICY_VERSION, generatedAt: new Date(nowMs).toISOString(), expiresAt: EXPIRES_AT, environment,
     optionalTree: { command: treeResult.command, rawExitCode: treeResult.exitCode, stderr: treeResult.stderr, jsonValid: treeResult.jsonValid,
       report: treeResult.parsed, rawStdout: treeResult.jsonValid ? undefined : treeResult.stdout, validation: optionalInput, decision: optionalDecision },
     security: { advisory: ALLOWED_ADVISORY,
@@ -425,8 +767,10 @@ async function normalEvidence() {
       dependencyTree: { command: explainResult.command, rawExitCode: explainResult.exitCode, stderr: explainResult.stderr, jsonValid: explainResult.jsonValid, validation: explainResult.jsonValid ? inspectExceptionChain(explainResult.parsed) : null, report: explainResult.parsed }, decision: securityDecision },
     decision: optionalDecision.accepted && securityDecision.accepted ? { accepted: true, code: "OPTIONAL_TREE_EXCEPTION_ACCEPTED" }
       : !optionalDecision.accepted ? optionalDecision : securityDecision };
+  if (evidence.decision.code !== "OPTIONAL_TREE_CONTENT_HASH_MISMATCH") return evidence;
+  return attachContentHashDiagnostic(evidence, await buildContentHashDiagnostic(environment));
 }
 const args = process.argv.slice(2);
-if (args.length === 1 && args[0] === "--self-test") process.exitCode = runSelfTest();
+if (args.length === 1 && args[0] === "--self-test") process.exitCode = await runSelfTest();
 else if (args.length) { process.stdout.write(`${JSON.stringify({ policyVersion: POLICY_VERSION, decision: { accepted: false, code: "USAGE_ERROR" }, usage: "node scripts/audit-security-policy.mjs [--self-test]" })}\n`); process.exitCode = 2; }
-else { const evidence = await normalEvidence(); process.stdout.write(`${JSON.stringify(evidence, null, 2)}\n`); process.exitCode = evidence.decision.accepted ? 0 : 1; }
+else { const evidence = await normalEvidence(); process.stdout.write(`${JSON.stringify(evidence, null, 2)}\n`); process.exitCode = evidenceExitCode(evidence); }
