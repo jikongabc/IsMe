@@ -41,94 +41,59 @@ verify_hash_match() {
   printf 'ci invariant=%s classification=unchanged exit_code=0\n' "$label"
 }
 
-audit_once() {
-  npm audit --audit-level=high
-}
-
-is_quick_audit_400_retirement_failure() {
-  local output_file="$1"
-
-  grep -Eqi 'https?://[^[:space:]]+/-/npm/v1/security/audits/quick([^[:alnum:]_-]|$)' "$output_file" \
-    && grep -Eqi '(^|[^0-9])400([^0-9]|$)' "$output_file" \
-    && grep -Eqi 'bad[[:space:]_-]+request|retir(e|ed|ing|ement)' "$output_file"
-}
-
-is_retryable_audit_failure() {
-  local output_file="$1"
-
-  # A vulnerability or lockfile failure always wins over transport evidence.
-  if grep -Eqi 'lockfile|(severity:[[:space:]]*|[[:digit:]]+[[:space:]]+)(high|critical)|"(high|critical)"[[:space:]]*:[[:space:]]*[1-9]' "$output_file"; then
-    return 1
-  fi
-
-  # npm's retiring Quick Audit endpoint has returned HTTP 400 / Bad Request
-  # together with the misleading text "Invalid package tree". Retry only when
-  # all three pieces of that incident signature are present.
-  if is_quick_audit_400_retirement_failure "$output_file"; then
-    return 0
-  fi
-
-  # Outside the exact incident signature, package-tree failures are local and
-  # must not be retried.
-  if grep -Eqi 'invalid package tree' "$output_file"; then
-    return 1
-  fi
-
-  grep -Eqi \
-    '((408|429|5[0-9][0-9]).*https?://[^[:space:]]+/-/npm/v1/security/audits/|https?://[^[:space:]]+/-/npm/v1/security/audits/.*(408|429|5[0-9][0-9]))' \
-    "$output_file"
-}
-
 run_dependency_audit() {
-  local attempt=1
-  local max_attempts=2
-  local classification
-  local output_file
-  output_file="$(mktemp "${TMPDIR:-/tmp}/isme-audit.XXXXXX")"
+  node scripts/audit-security-policy.mjs
+}
 
-  while (( attempt <= max_attempts )); do
-    local started=$SECONDS
-    local exit_code
-    : > "$output_file"
+run_sharp_smoke() {
+  node -e '
+const sharp = require("sharp");
 
-    if audit_once >"$output_file" 2>&1; then
-      exit_code=0
-    else
-      exit_code=$?
-    fi
+(async () => {
+  const input = await sharp({
+    create: {
+      width: 2,
+      height: 3,
+      channels: 3,
+      background: { r: 12, g: 34, b: 56 },
+    },
+  }).png().toBuffer();
+  const inputMetadata = await sharp(input).metadata();
+  const output = await sharp(input).resize(1, 1).png().toBuffer();
+  const outputMetadata = await sharp(output).metadata();
 
-    cat "$output_file"
+  if (
+    inputMetadata.width !== 2 ||
+    inputMetadata.height !== 3 ||
+    inputMetadata.format !== "png" ||
+    outputMetadata.width !== 1 ||
+    outputMetadata.height !== 1 ||
+    outputMetadata.format !== "png" ||
+    output.length === 0
+  ) {
+    throw new Error("sharp metadata/resize smoke invariant failed");
+  }
 
-    if (( exit_code == 0 )); then
-      classification="passed"
-      if (( attempt == 2 )); then
-        classification="recovered_after_external_transient"
-      fi
-      printf 'audit classification=%s attempt=%s elapsed_seconds=%s exit_code=0\n' \
-        "$classification" "$attempt" "$((SECONDS - started))"
-      rm -f -- "$output_file"
-      return 0
-    fi
-
-    if is_retryable_audit_failure "$output_file"; then
-      if (( attempt == 1 )); then
-        printf 'audit classification=external_transient_candidate attempt=1 elapsed_seconds=%s exit_code=%s retry=once\n' \
-          "$((SECONDS - started))" "$exit_code" >&2
-        attempt=2
-        continue
-      fi
-      classification="external_transient_retry_exhausted"
-    elif (( attempt == 2 )); then
-      classification="non_retryable_failure_after_retry"
-    else
-      classification="non_retryable_failure"
-    fi
-
-    printf 'audit classification=%s attempt=%s elapsed_seconds=%s exit_code=%s retry=none\n' \
-      "$classification" "$attempt" "$((SECONDS - started))" "$exit_code" >&2
-    rm -f -- "$output_file"
-    return "$exit_code"
-  done
+  process.stdout.write(JSON.stringify({
+    architecture: process.arch,
+    platform: process.platform,
+    input: {
+      width: inputMetadata.width,
+      height: inputMetadata.height,
+      format: inputMetadata.format,
+    },
+    output: {
+      width: outputMetadata.width,
+      height: outputMetadata.height,
+      format: outputMetadata.format,
+      bytes: output.length,
+    },
+  }) + "\n");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+'
 }
 
 verify_toolchain() {
@@ -192,12 +157,13 @@ main() {
 
   run_required_step toolchain verify_toolchain
   run_required_step npm-ci npm ci
-  run_required_step dependency-tree npm ls --all
   verify_hash_match package.json "$package_hash" "$(hash_file package.json)"
   verify_hash_match package-lock.json "$lock_hash" "$(hash_file package-lock.json)"
+  run_required_step policy-self-test node scripts/audit-security-policy.mjs --self-test
+  run_dependency_audit
+  run_required_step sharp-smoke run_sharp_smoke
   run_required_step lint npm run lint
   run_required_step unit-tests npm test
-  run_dependency_audit
 
   # Compilation must not depend on demo seeding or a pre-populated database.
   run_required_step empty-db-build env ISME_DATABASE_PATH="$ci_tmp_dir/isme-ci-empty.db" npm run build
